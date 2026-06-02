@@ -114,6 +114,10 @@ formation_mode  = "triangle"
 movement_active = True
 FORMATION_SPACING = 65.0
 
+# Arena physical dimensions (cm)
+ARENA_WIDTH_CM  = 300.0   # 3 m (yatay / horizontal)
+ARENA_HEIGHT_CM = 200.0   # 2 m (dikey / vertical)
+
 
 # ==============================================================================
 #  COORDINATE HELPERS
@@ -500,10 +504,47 @@ def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False)
 # ==============================================================================
 def get_formation_targets(leader_x, leader_y, leader_angle_deg):
     """
-    TRIANGLE: follower1 left-rear, follower2 right-rear, follower3 direct-rear.
-    LINE:     follower1 left, follower2 right, follower3 far-left.
+    Engel yokken: sabit ok (arrow) formasyonu (cm bazlı).
+        Robot 0 = lider (en önde)
+        Robot 1 = liderin 5 cm arkasında
+        Robot 2 = Robot 1'in güneybatısında, hipotenüs 13 cm  (12 cm sol, 5 cm arka)
+        Robot 3 = Robot 1'in güneydoğusunda, hipotenüs 13 cm  (12 cm sağ, 5 cm arka)
+        Robot 2 ↔ Robot 3 mesafesi = 24 cm
+
+    Engel varken: mevcut TRIANGLE / LINE davranışı.
     """
     rad = math.radians(leader_angle_deg)
+
+    if len(obstacles) == 0:
+        # ── Engel yok: cm bazlı ok formasyonu ──────────────────────
+        sx = LOGIC_GRID_MAX / ARENA_WIDTH_CM     # logic birim / cm  (yatay)
+        sy = LOGIC_GRID_MAX / ARENA_HEIGHT_CM    # logic birim / cm  (dikey)
+
+        cos_h = math.cos(rad)
+        sin_h = math.sin(rad)
+
+        # Offset (ileri_cm, sağ_cm)
+        #   ileri > 0  → liderin önünde
+        #   ileri < 0  → liderin arkasında
+        #   sağ   > 0  → sancak (sağ)
+        #   sağ   < 0  → iskele (sol)
+        cm_offsets = {
+            1: (-5.0,    0.0),   # 5 cm arkada, merkezde
+            2: (-10.0, -12.0),   # 10 cm arkada, 12 cm solda  (Robot 1'in GB'si)
+            3: (-10.0,  12.0),   # 10 cm arkada, 12 cm sağda  (Robot 1'in GD'si)
+        }
+
+        targets = {}
+        for rid, (fwd_cm, right_cm) in cm_offsets.items():
+            # Heading-bağıl → global (cm)
+            dx_cm = fwd_cm * cos_h - right_cm * sin_h
+            dy_cm = fwd_cm * sin_h + right_cm * cos_h
+            # cm → logic birim (anizotropik ölçek)
+            targets[rid] = (leader_x + dx_cm * sx,
+                            leader_y + dy_cm * sy)
+        return targets
+
+    # ── Engel var: mevcut polar-offset formasyonları ──────────────
     if formation_mode == "triangle":
         offsets = {1: (FORMATION_SPACING, -135),
                    2: (FORMATION_SPACING, +135),
