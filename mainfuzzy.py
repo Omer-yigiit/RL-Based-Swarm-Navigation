@@ -111,7 +111,7 @@ MAX_OBSTACLES   = 10
 OBSTACLE_RADIUS = 18.0
 
 formation_mode  = "triangle"
-movement_active = False
+movement_active = True
 FORMATION_SPACING = 65.0
 
 
@@ -155,6 +155,41 @@ def get_calibrated_angle(robot_id, raw_angle):
         robot_states[robot_id]["base_angle"] = raw_angle
         return 0
     return (raw_angle - robot_states[robot_id]["base_angle"] + 180) % 360 - 180
+
+
+
+# ==============================================================================
+#  KALMAN FILTER (POSITION TRACKING)
+# ==============================================================================
+class RobotTracker:
+    def __init__(self, dt=0.05):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                              [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, dt, 0],
+                                             [0, 1, 0, dt],
+                                             [0, 0, 1, 0],
+                                             [0, 0, 0, 1]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+        self.initialized = False
+
+    def predict(self):
+        pred = self.kf.predict()
+        return float(pred[0]), float(pred[1])
+
+    def update(self, x, y):
+        if not self.initialized:
+            self.kf.statePre = np.array([[x], [y], [0], [0]], np.float32)
+            self.kf.statePost = np.array([[x], [y], [0], [0]], np.float32)
+            self.initialized = True
+        
+        meas = np.array([[np.float32(x)], [np.float32(y)]])
+        self.kf.correct(meas)
+        return float(self.kf.statePost[0]), float(self.kf.statePost[1])
+
+robot_trackers = {rid: RobotTracker() for rid in ROBOTS}
 
 
 # ==============================================================================
@@ -219,6 +254,49 @@ class FuzzyCollision:
         rep_w  = (danger * 2.0 + risky * 0.5) / den_r if den_r > 0 else 0.0
         goal_w = (risky * 0.7 + safe * 1.0)   / den_r if den_r > 0 else 1.0
         return rep_w, goal_w
+
+
+class FuzzyFormationManager:
+    @staticmethod
+    def get_formation_mode(robot_states, obstacles):
+        """
+        Uses fuzzy logic to decide between TRIANGLE (narrow, safe for obstacles)
+        and LINE (wide, for open spaces) based on obstacle proximity.
+        """
+        # Find the leader's position
+        lx = robot_states[0]["x"]
+        ly = robot_states[0]["y"]
+        if lx is None or ly is None:
+            return "triangle" # Default fallback
+            
+        # 1. Calculate minimum distance from the leader to any obstacle
+        min_dist = 999.0
+        for (ox, oy, _) in obstacles:
+            dist = math.sqrt((ox - lx)**2 + (oy - ly)**2)
+            if dist < min_dist:
+                min_dist = dist
+                
+        # 2. Define fuzzy sets for obstacle proximity (Near, Mid, Far)
+        # Near (danger): trapezoid(min_dist, -1, 0, 80, 110)
+        # Mid (caution): trapezoid(min_dist, 80, 110, 150, 180)
+        # Far (safe):    trapezoid(min_dist, 150, 180, 9999, 9999)
+        f_near = FuzzyACC.trapezoid(min_dist, -1, 0, 80, 110)
+        f_mid  = FuzzyACC.trapezoid(min_dist, 80, 110, 150, 180)
+        f_far  = FuzzyACC.trapezoid(min_dist, 150, 180, 9999, 9999)
+        
+        # 3. Defuzzify to choose formation:
+        # - Triangle: score 0.0
+        # - Line: score 1.0
+        num = f_near * 0.0 + f_mid * 0.3 + f_far * 1.0
+        den = f_near + f_mid + f_far
+        
+        score = num / den if den > 0 else 0.0
+        
+        # If score < 0.5, choose triangle (narrow), otherwise choose line (wide)
+        if score < 0.5:
+            return "triangle"
+        else:
+            return "line"
 
 
 # ==============================================================================
@@ -309,23 +387,43 @@ def check_collision(robot_id, target_x, target_y):
     force_x = force_y = 0.0
     min_dist = 999.0
 
+    # 1. Robot-Robot Repulsion
     for oid, ost in robot_states.items():
         if oid == robot_id or ost["x"] is None: continue
         if robot_id == LEADER_ID: continue
         dx = st["x"] - ost["x"]; dy = st["y"] - ost["y"]
         dist = math.sqrt(dx**2 + dy**2)
         min_dist = min(min_dist, dist)
-        if 0 < dist < 50:
+        if 0 < dist < 60:
             s = (500.0 if oid == LEADER_ID else 250.0) / (dist + 1)
             force_x += (dx / dist) * s; force_y += (dy / dist) * s
 
-    for (ox, oy, _) in obstacles:
+    # 2. Advanced APF for Obstacles (Repulsive + Tangential/Vortex)
+    for (ox, oy, r) in obstacles:
         dx = st["x"] - ox; dy = st["y"] - oy
         dist = math.sqrt(dx**2 + dy**2)
         min_dist = min(min_dist, dist)
-        if 0 < dist < OBSTACLE_RADIUS + 20:
-            s = 400.0 / (dist + 1)
-            force_x += (dx / dist) * s; force_y += (dy / dist) * s
+        
+        eff_radius = r + 25  # Safety padding
+        if 0 < dist < eff_radius + 45:
+            # Repulsive Force
+            s_rep = 650.0 / (dist + 1)
+            f_rep_x = (dx / dist) * s_rep
+            f_rep_y = (dy / dist) * s_rep
+            
+            # Tangential (Vortex) Force to slide around the obstacle smoothly
+            # By adding a perpendicular vector (-dy, dx)
+            # The direction of the vortex depends on which side is faster to slide around
+            # We can use a simple cross product heuristic or just a fixed curl
+            cross_z = dx * (target_y - st["y"]) - dy * (target_x - st["x"])
+            sign = 1 if cross_z > 0 else -1
+            
+            s_tan = 450.0 / (dist + 1)
+            f_tan_x = -sign * dy / dist * s_tan
+            f_tan_y = sign * dx / dist * s_tan
+            
+            force_x += f_rep_x + f_tan_x
+            force_y += f_rep_y + f_tan_y
 
     rep_w, goal_w = FuzzyCollision.get_weights(min_dist)
     bx = target_x * goal_w + st["x"] * (1.0 - goal_w)
@@ -343,6 +441,30 @@ leader_prev_pos = {"x": None, "y": None, "t": time.time()}
 
 
 def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False):
+    st = robot_states[robot_id]
+    if st["x"] is None:
+        return 0, 0
+
+    # Hard Safety Shield: Inter-robot collision avoidance (Warning & Critical Zones)
+    for oid, ost in robot_states.items():
+        if oid != robot_id and ost["x"] is not None:
+            dist_o = math.sqrt((ost["x"] - st["x"])**2 + (ost["y"] - st["y"])**2)
+            if dist_o < 48.0:
+                angle_to_other = math.degrees(math.atan2(ost["y"] - st["y"], ost["x"] - st["x"])) % 360
+                heading = st["raw_angle"] % 360
+                diff_o = (angle_to_other - heading + 180) % 360 - 180
+                
+                if dist_o < 35.0:
+                    # CRITICAL ZONE: Actively separate
+                    if abs(diff_o) < 90:
+                        return -20, -20  # Back away
+                    else:
+                        return 20, 20   # Crawl forward
+                else:
+                    # WARNING ZONE: Stop to shed momentum if heading towards it
+                    if abs(diff_o) < 75:
+                        return 0, 0     # Stop
+
     adj_x, adj_y, min_d = check_collision(robot_id, t_x, t_y)
     st = robot_states[robot_id]
     if st["x"] is None: return 0, 0
@@ -413,7 +535,8 @@ def draw_speed_bar(panel, x, y, value, max_val, color, w=140, h=12):
 
 
 def draw_dashboard(panel, panel_h, now, movement_active, formation_mode,
-                   manual_id, ui_cache, last_seen, fps_cache, obstacle_count):
+                   manual_id, ui_cache, last_seen, fps_cache, obstacle_count,
+                   auto_formation_active):
     panel[:] = (18, 18, 22)
     cv2.line(panel, (0, 0), (0, panel_h), (50, 50, 50), 2)
     cv2.putText(panel, "SWARM OS v4.0", (15, 35), FONT, 0.8, (0, 220, 220), 2)
@@ -425,10 +548,10 @@ def draw_dashboard(panel, panel_h, now, movement_active, formation_mode,
     cv2.putText(panel, "DRIVE:",      (15, y), FONT, 0.5, (150, 150, 150), 1)
     cv2.putText(panel, mv_txt,        (120, y), FONT, 0.55, mv_clr, 2)
     y += 28
-    fm_txt = "TRIANGLE" if formation_mode == "triangle" else "LINE"
-    fm_clr = (255, 100, 255) if formation_mode == "triangle" else (0, 165, 255)
+    fm_txt = ("AUTO (" + ("TRI" if formation_mode == "triangle" else "LINE") + ")") if auto_formation_active else ("MANUAL (" + ("TRI" if formation_mode == "triangle" else "LINE") + ")")
+    fm_clr = (100, 255, 100) if auto_formation_active else (255, 100, 255) if formation_mode == "triangle" else (0, 165, 255)
     cv2.putText(panel, "FORMATION:",  (15, y), FONT, 0.5, (150, 150, 150), 1)
-    cv2.putText(panel, fm_txt,        (140, y), FONT, 0.55, fm_clr, 1)
+    cv2.putText(panel, fm_txt,        (140, y), FONT, 0.5, fm_clr, 1)
     y += 28
     ob_clr = (0, 255, 180) if obstacle_count == 0 else (0, 200, 255)
     cv2.putText(panel, "OBSTACLES:",  (15, y), FONT, 0.5, (150, 150, 150), 1)
@@ -472,7 +595,7 @@ def draw_dashboard(panel, panel_h, now, movement_active, formation_mode,
     cv2.line(panel, (15, y), (SIDEBAR_W - 15, y), (50, 50, 50), 1)
     cv2.line(panel, (15, panel_h - 110), (SIDEBAR_W - 15, panel_h - 110), (40, 40, 40), 1)
     shortcuts = [
-        ("[T] Start/Stop   [1] Line  [2] Triangle",  (15, panel_h - 88)),
+        ("[T]Start [1]Line [2]Tri [3]Auto",            (15, panel_h - 88)),
         ("[LClick] Add Obs  [RClick] Clear Obs",      (15, panel_h - 66)),
         ("[C] Reset  [F] Robot Sel  [Z] E-Stop",      (15, panel_h - 44)),
         ("[WASD] Drive  [V] HUD  [Q] Quit",           (15, panel_h - 22)),
@@ -484,7 +607,7 @@ def draw_dashboard(panel, panel_h, now, movement_active, formation_mode,
 # ==============================================================================
 #  CAMERA & INITIALISATION
 # ==============================================================================
-CAMERA_SOURCE = "http://10.38.169.196:8080/video"
+CAMERA_SOURCE = "http://100.72.52.14:8080/video"
 camera_stream = LatencyFreeCamera(CAMERA_SOURCE)
 
 fw, fh = 1280, 720
@@ -510,12 +633,13 @@ cv2.namedWindow("HUB", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("HUB", 1300, 720)
 cv2.setMouseCallback("HUB", mouse_callback)
 
-manual_target          = None
+manual_target          = (200.0, 200.0) # Default target at center of arena
 system_active          = False
 manual_id              = LEADER_ID
 last_seen_times        = {rid: time.time() for rid in ROBOTS}
 last_known_pixels      = {}
 last_formation_targets = {}
+auto_formation_active  = True # Start in Auto formation selection mode
 
 show_ui         = True
 ui_cache        = {rid: {"speed": 0.0, "dist_cm": 0, "x": "--", "y": "--"}
@@ -526,7 +650,7 @@ fps_cache       = {"fps": 0, "frame_count": 0, "last_time": time.time()}
 cached_sidebar  = None
 
 last_f_press = last_c_press = last_t_press = 0.0
-last_1_press = last_2_press = 0.0
+last_1_press = last_2_press = last_3_press = 0.0
 
 print("\n--- SWARM OS v4.0 STARTED ---")
 print("LEFT CLICK to place obstacles (max 10). RIGHT CLICK to clear.")
@@ -551,41 +675,222 @@ obs_dist_log= []                               # [(t, rid, min_obs_dist), ...]
 heading_log = []                               # [(t, angle_deg), ...]
 cmd_log     = {rid: [] for rid in ROBOTS}      # [(t, ls, rs), ...]
 
+robot_commands = {rid: (0, 0) for rid in ROBOTS}
+manual_ls = 0
+manual_rs = 0
+manual_drive_active = False
+
 # ==============================================================================
-#  MAIN LOOP
+#  MULTI-THREADING ARCHITECTURE
+# ==============================================================================
+state_lock = threading.Lock()
+current_frame = None
+vision_fps = 0
+
+class VisionThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+
+    def run(self):
+        global current_frame, vision_fps
+        fps_counter = 0
+        last_time = time.time()
+        while self.running:
+            frame = camera_stream.read()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            fh, fw = frame.shape[:2]
+            scale = DETECTION_WIDTH / float(fw) if DETECTION_WIDTH > 0 else 1.0
+            if scale != 1.0:
+                small_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0,0), fx=scale, fy=scale)
+            else:
+                small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            raw_tags = at_detector.detect(small_gray)
+            now = time.time()
+            
+            with state_lock:
+                detected_this_frame = set()
+                for tag in raw_tags:
+                    tid = tag.tag_id
+                    if tid not in ROBOTS: continue
+                    detected_this_frame.add(tid)
+                    
+                    cx = int(tag.center[0] / scale)
+                    cy = int(tag.center[1] / scale)
+                    corners = tag.corners / scale
+                    
+                    last_known_pixels[tid] = (cx, cy)
+                    last_seen_times[tid] = now
+                    
+                    nx, ny = normalize_coords(cx, cy, fw, fh)
+                    
+                    # Kalman Update
+                    kx, ky = robot_trackers[tid].update(nx, ny)
+                    
+                    bx = (corners[0][0]+corners[1][0])/2; by = (corners[0][1]+corners[1][1])/2
+                    tx = (corners[3][0]+corners[2][0])/2; ty = (corners[3][1]+corners[2][1])/2
+                    raw_angle = (int(math.degrees(math.atan2(ty-by, tx-bx)))+180) % 360
+                    net_angle = get_calibrated_angle(tid, raw_angle)
+                    
+                    robot_states[tid]["current_angle"] = net_angle
+                    robot_states[tid]["raw_angle"] = raw_angle
+                    robot_states[tid]["x"] = kx
+                    robot_states[tid]["y"] = ky
+                    
+                    pixel_w = math.sqrt((corners[1][0]-corners[0][0])**2+(corners[1][1]-corners[0][1])**2)
+                    ui_cache[tid]["dist_cm"] = int(calculate_distance(pixel_w))
+                    ui_cache[tid]["x"] = round(kx, 1)
+                    ui_cache[tid]["y"] = round(ky, 1)
+                    
+                    if tid == LEADER_ID:
+                        if (len(path_trail)==0 or math.sqrt((kx-path_trail[-1][0])**2+(ky-path_trail[-1][1])**2)>3):
+                            path_trail.append((kx, ky, raw_angle))
+                            
+                # Kalman Predict for occluded robots
+                for tid in ROBOTS:
+                    if tid not in detected_this_frame and robot_trackers[tid].initialized:
+                        time_since_seen = now - last_seen_times.get(tid, 0)
+                        if time_since_seen < 1.5:  # Blind tracking for 1.5s
+                            px, py = robot_trackers[tid].predict()
+                            robot_states[tid]["x"] = px
+                            robot_states[tid]["y"] = py
+                            ui_cache[tid]["x"] = round(px, 1)
+                            ui_cache[tid]["y"] = round(py, 1)
+            
+            current_frame = frame
+            
+            fps_counter += 1
+            if now - last_time > 1.0:
+                vision_fps = fps_counter
+                fps_counter = 0
+                last_time = now
+
+class ControlThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+
+    def run(self):
+        global formation_mode, leader_speed_ff, robot_commands
+        while self.running:
+            time.sleep(0.05) # 20 Hz
+            now = time.time()
+            t_rel = now - run_start_time
+            
+            with state_lock:
+                l_st = robot_states[LEADER_ID]
+                if l_st["x"] is not None:
+                    if leader_prev_pos["x"] is not None:
+                        dt_ff = now - leader_prev_pos["t"]
+                        if dt_ff > 0.01:
+                            dx_ff = l_st["x"] - leader_prev_pos["x"]
+                            dy_ff = l_st["y"] - leader_prev_pos["y"]
+                            inst  = math.sqrt(dx_ff**2 + dy_ff**2) / dt_ff
+                            leader_speed_ff = 0.7 * leader_speed_ff + 0.3 * inst
+                    leader_prev_pos["x"] = l_st["x"]
+                    leader_prev_pos["y"] = l_st["y"]
+                    leader_prev_pos["t"] = now
+
+                if auto_formation_active:
+                    formation_mode = FuzzyFormationManager.get_formation_mode(robot_states, obstacles)
+
+                if movement_active:
+                    if manual_target is not None:
+                        ls, rs = drive_robot(LEADER_ID, manual_target[0], manual_target[1], tolerance=12, slow_mode=True)
+                        robot_commands[LEADER_ID] = (ls, rs)
+
+                    if l_st["x"] is not None and len(path_trail) > 0:
+                        lx, ly, l_angle = path_trail[-1]
+                        formation_targets = get_formation_targets(lx, ly, l_angle)
+                        last_formation_targets.update(formation_targets)
+                        for rid in [1, 2, 3]:
+                            tx, ty = formation_targets[rid]
+                            ls, rs = drive_robot(rid, tx, ty, tolerance=12, slow_mode=True)
+                            robot_commands[rid] = (ls, rs)
+
+                    cohesion = 1.0
+                    errors = []
+                    for rid in [1, 2, 3]:
+                        st = robot_states[rid]
+                        if st["x"] is not None and rid in last_formation_targets:
+                            tx, ty = last_formation_targets[rid]
+                            err = math.sqrt((st["x"]-tx)**2 + (st["y"]-ty)**2)
+                            errors.append(err)
+                            fmt_log[rid].append((t_rel, err))
+
+                    if errors:
+                        max_err = max(errors)
+                        if max_err > 40.0:
+                            cohesion = max(0.0, 1.0 - (max_err - 40.0) / 40.0)
+
+                    coh_log.append((t_rel, cohesion))
+                    if LEADER_ID in robot_commands:
+                        ll, lr = robot_commands[LEADER_ID]
+                        robot_commands[LEADER_ID] = (int(ll * cohesion), int(lr * cohesion))
+
+                if manual_drive_active:
+                    robot_commands[manual_id] = (manual_ls, manual_rs)
+
+
+class CommThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+
+    def run(self):
+        while self.running:
+            time.sleep(0.05) # 20 Hz
+            now = time.time()
+            t_rel = now - run_start_time
+            
+            with state_lock:
+                for rid in ROBOTS:
+                    ls, rs = robot_commands.get(rid, (0, 0))
+                    if not movement_active and not (manual_drive_active and rid == manual_id):
+                        ls, rs = 0, 0
+                    if now - last_seen_times.get(rid, now) > 0.5:
+                        if not (manual_drive_active and rid == manual_id):
+                            ls, rs = 0, 0
+
+                    cmd_log[rid].append((t_rel, ls, rs))
+                    if now - last_cmd_times.get(rid, 0) > 0.15:
+                        send_robot_command(rid, ls, rs)
+                        last_cmd_times[rid] = now
+
+# Start background threads
+v_thread = VisionThread()
+c_thread = ControlThread()
+cm_thread = CommThread()
+
+v_thread.start()
+c_thread.start()
+cm_thread.start()
+
+# ==============================================================================
+#  MAIN LOOP (UI & Keyboard)
 # ==============================================================================
 try:
     while True:
         now = time.time()
         t_rel = now - run_start_time
-
-        # ── Leader feedforward speed ──────────────────────────────────────────
-        l_st = robot_states[LEADER_ID]
-        if l_st["x"] is not None:
-            if leader_prev_pos["x"] is not None:
-                dt_ff = now - leader_prev_pos["t"]
-                if dt_ff > 0.01:
-                    dx_ff = l_st["x"] - leader_prev_pos["x"]
-                    dy_ff = l_st["y"] - leader_prev_pos["y"]
-                    inst  = math.sqrt(dx_ff**2 + dy_ff**2) / dt_ff
-                    leader_speed_ff = 0.7 * leader_speed_ff + 0.3 * inst
-            leader_prev_pos["x"] = l_st["x"]
-            leader_prev_pos["y"] = l_st["y"]
-            leader_prev_pos["t"] = now
-
+        
         # ── Keyboard: cycle robot ──────────────────────────────────────────────
         if keyboard.is_pressed("f") and (now - last_f_press > 0.5):
             last_f_press = now
             id_list  = list(ROBOTS.keys())
-            manual_id = id_list[(id_list.index(manual_id) + 1) % len(id_list)] \
-                        if manual_id in id_list else LEADER_ID
+            manual_id = id_list[(id_list.index(manual_id) + 1) % len(id_list)] if manual_id in id_list else LEADER_ID
             print(f"> Manual control: {ROBOTS[manual_id]['name']}")
 
         # ── [C] reset ─────────────────────────────────────────────────────────
         if keyboard.is_pressed("c") and (now - last_c_press > 0.5):
             last_c_press = now
-            for rid in robot_states: robot_states[rid]["base_angle"] = None
-            path_trail.clear(); manual_target = None; obstacles.clear()
+            with state_lock:
+                for rid in robot_states: robot_states[rid]["base_angle"] = None
+                path_trail.clear(); manual_target = None; obstacles.clear()
             print("> Calibration, path, target and obstacles reset!")
 
         # ── [T] toggle movement ───────────────────────────────────────────────
@@ -593,206 +898,110 @@ try:
             last_t_press    = now
             movement_active = not movement_active
             if not movement_active:
-                for rid in ROBOTS: send_robot_command(rid, 0, 0)
-            print(f"> Movement {'STARTED' if movement_active else 'STOPPED'} "
-                  f"| Formation: {formation_mode.upper()}")
+                with state_lock:
+                    for rid in ROBOTS: send_robot_command(rid, 0, 0)
+            print(f"> Movement {'STARTED' if movement_active else 'STOPPED'} | Formation: {formation_mode.upper()}")
 
-        # ── [1]/[2] formation ─────────────────────────────────────────────────
+        # ── [1]/[2]/[3] formation ─────────────────────────────────────────────
         if keyboard.is_pressed("1") and (now - last_1_press > 0.5):
-            last_1_press   = now; formation_mode = "line"
-            print("> Formation: LINE")
+            last_1_press   = now; formation_mode = "line"; auto_formation_active = False
+            print("> Formation: LINE (Manual Override)")
         if keyboard.is_pressed("2") and (now - last_2_press > 0.5):
-            last_2_press   = now; formation_mode = "triangle"
-            print("> Formation: TRIANGLE")
+            last_2_press   = now; formation_mode = "triangle"; auto_formation_active = False
+            print("> Formation: TRIANGLE (Manual Override)")
+        if keyboard.is_pressed("3") and (now - last_3_press > 0.5):
+            last_3_press   = now; auto_formation_active = True
+            print("> Formation: AUTOMATIC (Fuzzy Decision Active)")
 
         # ── WASD manual drive ─────────────────────────────────────────────────
-        manual_ls = manual_rs = 0
-        manual_drive_active = False
+        m_ls = m_rs = 0
+        m_active = False
         if any(keyboard.is_pressed(k) for k in ["w", "a", "s", "d"]):
-            manual_drive_active = True
+            m_active = True
             spd = 30 if keyboard.is_pressed("shift") else 25
             fwd = (1 if keyboard.is_pressed("w") else -1 if keyboard.is_pressed("s") else 0)
             trn = (-1 if keyboard.is_pressed("a") else 1 if keyboard.is_pressed("d") else 0)
-            if trn == 0:   manual_ls, manual_rs = fwd*spd, fwd*spd
-            elif fwd == 0: manual_ls, manual_rs = trn*spd, -trn*spd
-            elif trn == -1:manual_ls, manual_rs = int(fwd*spd*0.2), fwd*spd
-            else:          manual_ls, manual_rs = fwd*spd, int(fwd*spd*0.2)
+            if trn == 0:   m_ls, m_rs = fwd*spd, fwd*spd
+            elif fwd == 0: m_ls, m_rs = trn*spd, -trn*spd
+            elif trn == -1:m_ls, m_rs = int(fwd*spd*0.2), fwd*spd
+            else:          m_ls, m_rs = fwd*spd, int(fwd*spd*0.2)
+        
+        with state_lock:
+            manual_ls, manual_rs = m_ls, m_rs
+            manual_drive_active = m_active
 
-        # ── Formation control ─────────────────────────────────────────────────
-        robot_commands = {}
+        # ── Data Logging & UI cache ───────────────────────────────────────────
+        if now - last_ui_update > 0.5:
+            last_ui_update = now
+            with state_lock:
+                for rid in ROBOTS:
+                    st   = robot_states[rid]
+                    prev = ui_prev_pos[rid]
+                    if st["x"] is not None and prev["x"] is not None:
+                        dx_h = st["x"] - prev["x"]; dy_h = st["y"] - prev["y"]
+                        dt_h = now - prev["t"]
+                        if dt_h > 0:
+                            spd = round(math.sqrt(dx_h**2+dy_h**2)/dt_h*0.5, 1)
+                            ui_cache[rid]["speed"] = spd
+                            spd_log[rid].append((t_rel, spd))
+                    if st["x"] is not None:
+                        pos_log[rid].append((t_rel, st["x"], st["y"]))
+                    ui_prev_pos[rid] = {"x": st["x"], "y": st["y"], "t": now}
 
-        if movement_active:
-            if manual_target is not None:
-                ls, rs = drive_robot(LEADER_ID, manual_target[0], manual_target[1],
-                                     tolerance=12, slow_mode=True)
-                robot_commands[LEADER_ID] = (ls, rs)
+                for (a, b) in pair_log:
+                    sa, sb = robot_states[a], robot_states[b]
+                    if sa["x"] is not None and sb["x"] is not None:
+                        d = math.sqrt((sa["x"]-sb["x"])**2+(sa["y"]-sb["y"])**2)
+                        pair_log[(a,b)].append((t_rel, d))
 
-            if l_st["x"] is not None and len(path_trail) > 0:
-                lx, ly, l_angle = path_trail[-1]
-                formation_targets = get_formation_targets(lx, ly, l_angle)
-                last_formation_targets.update(formation_targets)
-                for rid in [1, 2, 3]:
-                    tx, ty = formation_targets[rid]
-                    ls, rs  = drive_robot(rid, tx, ty, tolerance=12, slow_mode=True)
-                    robot_commands[rid] = (ls, rs)
+                if obstacles:
+                    for rid in ROBOTS:
+                        st = robot_states[rid]
+                        if st["x"] is not None:
+                            min_od = min(math.sqrt((st["x"]-ox)**2+(st["y"]-oy)**2) for ox, oy, _ in obstacles)
+                            obs_dist_log.append((t_rel, rid, min_od))
 
-            # Swarm cohesion
-            cohesion = 1.0
-            errors   = []
-            for rid in [1, 2, 3]:
-                st = robot_states[rid]
-                if st["x"] is not None and rid in last_formation_targets:
-                    tx, ty = last_formation_targets[rid]
-                    err = math.sqrt((st["x"]-tx)**2 + (st["y"]-ty)**2)
-                    errors.append(err)
-                    fmt_log[rid].append((t_rel, err))   # LOG formation error
+                l_raw = robot_states[LEADER_ID]["raw_angle"]
+                heading_log.append((t_rel, l_raw))
+        
+        with state_lock:
+            fps_cache["fps"] = vision_fps
 
-            if errors:
-                max_err = max(errors)
-                if max_err > 40.0:
-                    cohesion = max(0.0, 1.0 - (max_err - 40.0) / 40.0)
-
-            coh_log.append((t_rel, cohesion))           # LOG cohesion
-
-            if LEADER_ID in robot_commands:
-                ll, lr = robot_commands[LEADER_ID]
-                robot_commands[LEADER_ID] = (int(ll * cohesion), int(lr * cohesion))
-
-        if manual_drive_active:
-            robot_commands[manual_id] = (manual_ls, manual_rs)
-
-        # LOG motor commands
-        for rid in ROBOTS:
-            ls_v, rs_v = robot_commands.get(rid, (0, 0))
-            cmd_log[rid].append((t_rel, ls_v, rs_v))
-
-        # Send commands
-        for rid in ROBOTS:
-            ls, rs = robot_commands.get(rid, (0, 0))
-            if not movement_active and not (manual_drive_active and rid == manual_id):
-                ls, rs = 0, 0
-            if now - last_seen_times.get(rid, now) > 0.5:
-                if not (manual_drive_active and rid == manual_id):
-                    ls, rs = 0, 0
-            if now - last_cmd_times.get(rid, 0) > 0.15:
-                send_robot_command(rid, ls, rs)
-                last_cmd_times[rid] = now
-
-        # ── Camera frame ──────────────────────────────────────────────────────
-        frame = camera_stream.read()
-        if frame is None:
-            time.sleep(0.01); continue
-
-        fh, fw = frame.shape[:2]
-        tags   = []
-        scale  = DETECTION_WIDTH / float(fw) if DETECTION_WIDTH > 0 else 1.0
-        if scale != 1.0:
-            small_gray = cv2.resize(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (0,0), fx=scale, fy=scale)
-        else:
-            small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        raw_tags = at_detector.detect(small_gray)
-        for tag in raw_tags:
-            tag.center  = [tag.center[0]/scale, tag.center[1]/scale]
-            tag.corners = tag.corners / scale
-            tags.append(tag)
-
-        for tag in tags:
-            tid = tag.tag_id
-            corners = tag.corners.astype(int)
-            cx, cy  = int(tag.center[0]), int(tag.center[1])
-            last_known_pixels[tid] = (cx, cy)
-            if tid in last_seen_times: last_seen_times[tid] = now
-            if tid not in ROBOTS: continue
-
-            nx, ny = normalize_coords(cx, cy, fw, fh)
-            sx, sy = apply_ema(tid, nx, ny)
-
-            bx = (corners[0][0]+corners[1][0])/2; by = (corners[0][1]+corners[1][1])/2
-            tx = (corners[3][0]+corners[2][0])/2; ty = (corners[3][1]+corners[2][1])/2
-            raw_angle = (int(math.degrees(math.atan2(ty-by, tx-bx)))+180) % 360
-            net_angle = get_calibrated_angle(tid, raw_angle)
-            robot_states[tid]["current_angle"] = net_angle
-            robot_states[tid]["raw_angle"]     = raw_angle
-
-            pixel_w = math.sqrt((corners[1][0]-corners[0][0])**2+(corners[1][1]-corners[0][1])**2)
-            r_color = ROBOTS[tid]["color"]
-
-            if show_ui:
+        # ── Drawing UI ────────────────────────────────────────────────────────
+        if current_frame is None:
+            time.sleep(0.01)
+            continue
+            
+        with state_lock:
+            frame = current_frame.copy()
+            local_path_trail = list(path_trail)
+            local_targets = dict(last_formation_targets)
+            local_obstacles = list(obstacles)
+            local_pixels = dict(last_known_pixels)
+            local_movement = movement_active
+            local_formation = formation_mode
+            local_auto_formation = auto_formation_active
+        
+        if show_ui:
+            for rid, (cx, cy) in local_pixels.items():
+                if now - last_seen_times.get(rid, now) > 0.5: continue
+                r_color = ROBOTS[rid]["color"]
                 cv2.circle(frame, (cx, cy), 4, r_color, -1)
                 tpx = tpy = None
-                if tid == LEADER_ID and manual_target is not None:
+                if rid == LEADER_ID and manual_target is not None:
                     tpx = int(manual_target[0]/400*fw); tpy = int(manual_target[1]/400*fh)
-                elif tid in [1,2,3] and tid in last_formation_targets:
-                    ft = last_formation_targets[tid]
+                elif rid in [1,2,3] and rid in local_targets:
+                    ft = local_targets[rid]
                     tpx = int(ft[0]/400*fw); tpy = int(ft[1]/400*fh)
                 if tpx is not None:
                     ddx, ddy = tpx-cx, tpy-cy
                     ad = math.sqrt(ddx**2+ddy**2)
                     if ad > 5:
                         al = min(30, ad)
-                        cv2.arrowedLine(frame,(cx,cy),
-                                        (int(cx+ddx/ad*al), int(cy+ddy/ad*al)),
-                                        r_color, 2, tipLength=0.35)
+                        cv2.arrowedLine(frame,(cx,cy),(int(cx+ddx/ad*al), int(cy+ddy/ad*al)), r_color, 2, tipLength=0.35)
 
-            ui_cache[tid]["dist_cm"] = int(calculate_distance(pixel_w))
-            ui_cache[tid]["x"]       = sx
-            ui_cache[tid]["y"]       = sy
-
-            if tid == LEADER_ID:
-                if (len(path_trail)==0 or
-                        math.sqrt((nx-path_trail[-1][0])**2+(ny-path_trail[-1][1])**2)>3):
-                    path_trail.append((nx, ny, raw_angle))
-
-        # ── UI velocity update + LOG ──────────────────────────────────────────
-        if now - last_ui_update > 0.5:
-            last_ui_update = now
-            for rid in ROBOTS:
-                st   = robot_states[rid]
-                prev = ui_prev_pos[rid]
-                if st["x"] is not None and prev["x"] is not None:
-                    dx_h = st["x"] - prev["x"]; dy_h = st["y"] - prev["y"]
-                    dt_h = now - prev["t"]
-                    if dt_h > 0:
-                        spd = round(math.sqrt(dx_h**2+dy_h**2)/dt_h*0.5, 1)
-                        ui_cache[rid]["speed"] = spd
-                        spd_log[rid].append((t_rel, spd))          # LOG speed
-                if st["x"] is not None:
-                    pos_log[rid].append((t_rel, st["x"], st["y"])) # LOG position
-                ui_prev_pos[rid] = {"x": st["x"], "y": st["y"], "t": now}
-
-            # LOG inter-robot distances
-            for (a, b) in pair_log:
-                sa, sb = robot_states[a], robot_states[b]
-                if sa["x"] is not None and sb["x"] is not None:
-                    d = math.sqrt((sa["x"]-sb["x"])**2+(sa["y"]-sb["y"])**2)
-                    pair_log[(a,b)].append((t_rel, d))
-
-            # LOG obstacle proximity
-            if obstacles:
-                for rid in ROBOTS:
-                    st = robot_states[rid]
-                    if st["x"] is not None:
-                        min_od = min(math.sqrt((st["x"]-ox)**2+(st["y"]-oy)**2)
-                                     for ox, oy, _ in obstacles)
-                        obs_dist_log.append((t_rel, rid, min_od))
-
-            # LOG leader heading
-            l_raw = robot_states[LEADER_ID]["raw_angle"]
-            heading_log.append((t_rel, l_raw))
-
-        fps_cache["frame_count"] += 1
-        if now - fps_cache["last_time"] > 1.0:
-            fps_cache["fps"]         = fps_cache["frame_count"]
-            fps_cache["frame_count"] = 0
-            fps_cache["last_time"]   = now
-
-        # ── Drawing ───────────────────────────────────────────────────────────
-        if show_ui:
-            if len(path_trail) > 1:
-                pts = np.array([[int(p[0]/400*fw), int(p[1]/400*fh)] for p in path_trail],
-                               np.int32).reshape((-1,1,2))
+            if len(local_path_trail) > 1:
+                pts = np.array([[int(p[0]/400*fw), int(p[1]/400*fh)] for p in local_path_trail], np.int32).reshape((-1,1,2))
                 cv2.polylines(frame, [pts], False, (0,200,255), 2)
 
             if manual_target is not None:
@@ -800,7 +1009,7 @@ try:
                 cv2.drawMarker(frame,(hx,hy),(0,255,100),cv2.MARKER_CROSS,20,2)
                 cv2.circle(frame,(hx,hy),15,(0,255,100),1)
 
-            for i, (ox, oy, r) in enumerate(obstacles):
+            for i, (ox, oy, r) in enumerate(local_obstacles):
                 px = int((ox/LOGIC_GRID_MAX)*fw); py = int((oy/LOGIC_GRID_MAX)*fh)
                 pr = max(int((r/LOGIC_GRID_MAX)*fw), 8)
                 overlay = frame.copy()
@@ -809,60 +1018,62 @@ try:
                 cv2.circle(frame,(px,py),pr,(0,80,255),2)
                 cv2.putText(frame,f"O{i+1}",(px-8,py+5),FONT,0.45,(255,200,200),1)
 
-            for rid,(tx,ty) in last_formation_targets.items():
+            for rid,(tx,ty) in local_targets.items():
                 px=int((tx/LOGIC_GRID_MAX)*fw); py=int((ty/LOGIC_GRID_MAX)*fh)
-                cv2.drawMarker(frame,(px,py),ROBOTS[rid]["color"],
-                               cv2.MARKER_TILTED_CROSS,16,1)
+                cv2.drawMarker(frame,(px,py),ROBOTS[rid]["color"],cv2.MARKER_TILTED_CROSS,16,1)
 
             cv2.rectangle(frame,(0,0),(440,62),(0,0,0),-1)
-            mv_col = (0,255,100) if movement_active else (0,80,255)
-            mv_lbl = "MOVING" if movement_active else "STOPPED — press [T]"
+            mv_col = (0,255,100) if local_movement else (0,80,255)
+            mv_lbl = "MOVING" if local_movement else "STOPPED — press [T]"
             cv2.putText(frame,f"[T] {mv_lbl}",(8,22),FONT,0.6,mv_col,2)
-            cv2.putText(frame,f"[1/2] Formation: {formation_mode.upper()}",
-                        (8,44),FONT,0.55,(200,200,0),1)
-            cv2.putText(frame,f"OBS: {len(obstacles)}/{MAX_OBSTACLES}  RClick=clear",
-                        (245,44),FONT,0.45,(100,200,255),1)
+            fmt_lbl = ("AUTO (" + ("TRI" if local_formation == "triangle" else "LINE") + ")") if local_auto_formation else local_formation.upper()
+            cv2.putText(frame,f"[1/2/3] Formation: {fmt_lbl}",(8,44),FONT,0.55,(200,200,0),1)
+            cv2.putText(frame,f"OBS: {len(local_obstacles)}/{MAX_OBSTACLES}  RClick=clear",(245,44),FONT,0.45,(100,200,255),1)
         else:
             cv2.putText(frame,"HUD [V]",(fw-80,fh-10),FONT,0.9,(100,100,100),1)
 
-        cam_h      = TARGET_H
-        cam_w      = int(fw * (TARGET_H / fh))
+        cam_h = TARGET_H
+        cam_w = int(fw * (TARGET_H / fh))
         cam_scaled = cv2.resize(frame,(cam_w,cam_h),interpolation=cv2.INTER_NEAREST)
 
         if show_ui:
-            if (cached_sidebar is None or cached_sidebar.shape[0]!=cam_h or
-                    now - last_ui_update < 0.05):
+            if (cached_sidebar is None or cached_sidebar.shape[0]!=cam_h or now - last_ui_update < 0.05):
                 cached_sidebar = np.zeros((cam_h,SIDEBAR_W,3),dtype=np.uint8)
-                draw_dashboard(cached_sidebar,cam_h,now,movement_active,formation_mode,
-                               manual_id,ui_cache,last_seen_times,fps_cache,len(obstacles))
+                with state_lock:
+                    draw_dashboard(cached_sidebar,cam_h,now,local_movement,local_formation,
+                                   manual_id,ui_cache,last_seen_times,fps_cache,len(local_obstacles),
+                                   local_auto_formation)
             display = cv2.hconcat([cam_scaled, cached_sidebar])
         else:
             display = cam_scaled
 
         cv2.imshow("HUB", display)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(20) & 0xFF
 
         if key == ord("q"):
-            for rid in ROBOTS: send_robot_command(rid, 0, 0)
+            with state_lock:
+                for rid in ROBOTS: send_robot_command(rid, 0, 0)
             break
         elif key == ord("t") or key == ord("T"):
             movement_active = not movement_active
             if not movement_active:
-                for rid in ROBOTS: send_robot_command(rid, 0, 0)
-            print(f"> [T] Movement {'STARTED' if movement_active else 'STOPPED'} "
-                  f"| Formation: {formation_mode.upper()}")
+                with state_lock:
+                    for rid in ROBOTS: send_robot_command(rid, 0, 0)
         elif key == ord("1"):
-            formation_mode = "line";     print("> Formation: LINE")
+            formation_mode = "line"; auto_formation_active = False
         elif key == ord("2"):
-            formation_mode = "triangle"; print("> Formation: TRIANGLE")
+            formation_mode = "triangle"; auto_formation_active = False
+        elif key == ord("3"):
+            auto_formation_active = True
         elif key == ord("c") or key == ord("C"):
-            for rid in robot_states: robot_states[rid]["base_angle"] = None
-            path_trail.clear(); manual_target = None; obstacles.clear()
-            print("> Calibration, path, target and obstacles reset!")
+            with state_lock:
+                for rid in robot_states: robot_states[rid]["base_angle"] = None
+                path_trail.clear(); manual_target = None; obstacles.clear()
         elif key == ord("z") or key == ord("e"):
             movement_active = not movement_active
             if not movement_active:
-                for rid in ROBOTS: send_robot_command(rid, 0, 0)
+                with state_lock:
+                    for rid in ROBOTS: send_robot_command(rid, 0, 0)
         elif key == ord("v"):
             show_ui = not show_ui
 
