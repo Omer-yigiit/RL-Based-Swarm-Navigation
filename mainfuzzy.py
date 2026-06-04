@@ -621,16 +621,12 @@ fw, fh = 1280, 720
 
 
 def mouse_callback(event, x, y, flags, param):
-    global obstacles, fw, fh
+    global obstacles, fw, fh, manual_target
     if event == cv2.EVENT_LBUTTONDOWN:
-        if len(obstacles) < MAX_OBSTACLES:
-            lx = (x / fw) * LOGIC_GRID_MAX
-            ly = (y / fh) * LOGIC_GRID_MAX
-            obstacles.append((lx, ly, OBSTACLE_RADIUS))
-            print(f"[OBS] Placed at ({lx:.0f}, {ly:.0f}) "
-                  f"— total {len(obstacles)}/{MAX_OBSTACLES}")
-        else:
-            print(f"[OBS] Max {MAX_OBSTACLES} reached. Right-click to clear.")
+        lx = (x / fw) * LOGIC_GRID_MAX
+        ly = (y / fh) * LOGIC_GRID_MAX
+        manual_target = (lx, ly)
+        print(f"[TARGET] Leader hedef: ({lx:.0f}, {ly:.0f})")
     elif event == cv2.EVENT_RBUTTONDOWN:
         obstacles.clear()
         print("[OBS] All obstacles cleared.")
@@ -660,9 +656,8 @@ last_f_press = last_c_press = last_t_press = 0.0
 last_1_press = last_2_press = last_3_press = 0.0
 
 print("\n--- SWARM OS v4.0 STARTED ---")
-print("LEFT CLICK to place obstacles (max 10). RIGHT CLICK to clear.")
+print("LEFT CLICK to set leader target. RIGHT CLICK to clear obstacles.")
 print("Press [T] to start / stop formation movement.")
-print("Press [1] for LINE, [2] for TRIANGLE formation.")
 print("Press [F] to cycle which robot WASD controls.")
 
 path_trail.clear()
