@@ -374,8 +374,8 @@ def send_robot_command(robot_id, left, right):
         left  *= cal["speed_factor"]; right *= cal["speed_factor"]
         if cal["left_rev"]:  left  = -left
         if cal["right_rev"]: right = -right
-    left  = max(-30, min(30, int(left)))
-    right = max(-30, min(30, int(right)))
+    left  = max(-50, min(50, int(left)))
+    right = max(-50, min(50, int(right)))
     if gateway_serial and gateway_serial.is_open:
         gateway_serial.write(f"<{robot_id},{left},{right}>\n".encode("utf-8"))
         gateway_serial.flush()
@@ -479,21 +479,21 @@ def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False)
         diff = (target_angle - st["raw_angle"] + 180) % 360 - 180
         if use_pid:
             turn = pid_turn[robot_id].compute(diff)
-            if slow_mode: turn = max(-15.0, min(15.0, turn))
+            if slow_mode: turn = max(-20.0, min(20.0, turn))
         else:
             turn = diff * 0.5
         if abs(diff) < 5.0:
             turn = 0.0
             if use_pid: pid_turn[robot_id].integral = 0.0
-        fwd_max  = 22 if slow_mode else 28
-        turn_max = 18 if slow_mode else 24
+        fwd_max  = 32 if slow_mode else 42
+        turn_max = 24 if slow_mode else 32
         fs = FuzzyACC.get_speed_multiplier(dist_target=dist, dist_neighbor=min_d, angle_err=diff)
         if abs(diff) > 60:
             fwd  = 0; turn = turn_max if diff > 0 else -turn_max
         else:
             fwd = int(fwd_max * fs * max(0.0, math.cos(math.radians(diff))))
             if robot_id != LEADER_ID:
-                fwd += max(0, min(8, int(leader_speed_ff * 0.12)))
+                fwd += max(0, min(14, int(leader_speed_ff * 0.20)))
         return fwd + turn, fwd - turn
     if use_pid: pid_turn[robot_id].integral = 0.0
     return 0, 0
@@ -504,55 +504,20 @@ def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False)
 # ==============================================================================
 def get_formation_targets(leader_x, leader_y, leader_angle_deg):
     """
-    Engel yokken: sabit ok (arrow) formasyonu (cm bazlı).
+    Üçgen formasyonu — her zaman aynı (engel olsun olmasın).
         Robot 0 = lider (en önde)
-        Robot 1 = liderin 5 cm arkasında
-        Robot 2 = Robot 1'in güneybatısında, hipotenüs 13 cm  (12 cm sol, 5 cm arka)
-        Robot 3 = Robot 1'in güneydoğusunda, hipotenüs 13 cm  (12 cm sağ, 5 cm arka)
-        Robot 2 ↔ Robot 3 mesafesi = 24 cm
-
-    Engel varken: mevcut TRIANGLE / LINE davranışı.
+        Robot 1 = sol arka  (-140°)
+        Robot 3 = orta arka (180°, lidere daha yakın)
+        Robot 2 = sağ arka  (+140°)
     """
     rad = math.radians(leader_angle_deg)
 
-    if len(obstacles) == 0:
-        # ── Engel yok: cm bazlı ok formasyonu ──────────────────────
-        sx = LOGIC_GRID_MAX / ARENA_WIDTH_CM     # logic birim / cm  (yatay)
-        sy = LOGIC_GRID_MAX / ARENA_HEIGHT_CM    # logic birim / cm  (dikey)
+    offsets = {
+        1: (FORMATION_SPACING,        -140),   # sol arka
+        3: (FORMATION_SPACING * 0.75,  180),   # orta arka (lidere yakın)
+        2: (FORMATION_SPACING,        +140),   # sağ arka
+    }
 
-        cos_h = math.cos(rad)
-        sin_h = math.sin(rad)
-
-        # Offset (ileri_cm, sağ_cm)
-        #   ileri > 0  → liderin önünde
-        #   ileri < 0  → liderin arkasında
-        #   sağ   > 0  → sancak (sağ)
-        #   sağ   < 0  → iskele (sol)
-        cm_offsets = {
-            1: (-5.0,    0.0),   # 5 cm arkada, merkezde
-            2: (-10.0, -12.0),   # 10 cm arkada, 12 cm solda  (Robot 1'in GB'si)
-            3: (-10.0,  12.0),   # 10 cm arkada, 12 cm sağda  (Robot 1'in GD'si)
-        }
-
-        targets = {}
-        for rid, (fwd_cm, right_cm) in cm_offsets.items():
-            # Heading-bağıl → global (cm)
-            dx_cm = fwd_cm * cos_h - right_cm * sin_h
-            dy_cm = fwd_cm * sin_h + right_cm * cos_h
-            # cm → logic birim (anizotropik ölçek)
-            targets[rid] = (leader_x + dx_cm * sx,
-                            leader_y + dy_cm * sy)
-        return targets
-
-    # ── Engel var: mevcut polar-offset formasyonları ──────────────
-    if formation_mode == "triangle":
-        offsets = {1: (FORMATION_SPACING, -135),
-                   2: (FORMATION_SPACING, +135),
-                   3: (FORMATION_SPACING * 1.45, 180)}
-    else:
-        offsets = {1: (FORMATION_SPACING,      -90),
-                   2: (FORMATION_SPACING,      +90),
-                   3: (FORMATION_SPACING * 2.0, -90)}
     return {
         rid: (leader_x + d * math.cos(rad + math.radians(a)),
               leader_y + d * math.sin(rad + math.radians(a)))
@@ -841,7 +806,7 @@ class ControlThread(threading.Thread):
 
                 if movement_active:
                     if manual_target is not None:
-                        ls, rs = drive_robot(LEADER_ID, manual_target[0], manual_target[1], tolerance=12, slow_mode=True)
+                        ls, rs = drive_robot(LEADER_ID, manual_target[0], manual_target[1], tolerance=12, slow_mode=False)
                         robot_commands[LEADER_ID] = (ls, rs)
 
                     if l_st["x"] is not None and len(path_trail) > 0:
@@ -850,7 +815,7 @@ class ControlThread(threading.Thread):
                         last_formation_targets.update(formation_targets)
                         for rid in [1, 2, 3]:
                             tx, ty = formation_targets[rid]
-                            ls, rs = drive_robot(rid, tx, ty, tolerance=12, slow_mode=True)
+                            ls, rs = drive_robot(rid, tx, ty, tolerance=12, slow_mode=False)
                             robot_commands[rid] = (ls, rs)
 
                     cohesion = 1.0
