@@ -454,12 +454,12 @@ def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False)
     for oid, ost in robot_states.items():
         if oid != robot_id and ost["x"] is not None:
             dist_o = math.sqrt((ost["x"] - st["x"])**2 + (ost["y"] - st["y"])**2)
-            if dist_o < 20.0:
+            if dist_o < 14.0:
                 angle_to_other = math.degrees(math.atan2(ost["y"] - st["y"], ost["x"] - st["x"])) % 360
                 heading = st["raw_angle"] % 360
                 diff_o = (angle_to_other - heading + 180) % 360 - 180
                 
-                if dist_o < 18.0:
+                if dist_o < 10.0:
                     # CRITICAL ZONE: Actively separate
                     if abs(diff_o) < 90:
                         return -15, -15  # Back away
