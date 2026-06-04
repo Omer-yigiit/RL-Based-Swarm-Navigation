@@ -213,9 +213,9 @@ class FuzzyACC:
         t_near = FuzzyACC.trapezoid(dist_target,  -1,   0,  15,  30)
         t_mid  = FuzzyACC.trapezoid(dist_target,  15,  30,  60,  80)
         t_far  = FuzzyACC.trapezoid(dist_target,  60,  80, 9999, 9999)
-        n_danger = FuzzyACC.trapezoid(dist_neighbor, -1,  0,  20,  26)
-        n_mid    = FuzzyACC.trapezoid(dist_neighbor, 20, 26,  40,  60)
-        n_safe   = FuzzyACC.trapezoid(dist_neighbor, 40, 60, 9999, 9999)
+        n_danger = FuzzyACC.trapezoid(dist_neighbor, -1,  0,  10,  16)
+        n_mid    = FuzzyACC.trapezoid(dist_neighbor, 10, 16,  25,  35)
+        n_safe   = FuzzyACC.trapezoid(dist_neighbor, 25, 35, 9999, 9999)
         abs_err    = abs(angle_err)
         a_straight = FuzzyACC.trapezoid(abs_err, -1,  0,  10,  25)
         a_medium   = FuzzyACC.trapezoid(abs_err, 10, 25,  45,  60)
@@ -226,14 +226,15 @@ class FuzzyACC:
             nonlocal num, den
             num += w * v; den += w
 
-        rule(n_danger,                    0.0)
+        rule(n_danger,                    0.15)
         rule(a_sharp,                     0.0)
-        rule(t_near * a_straight,         0.5)
-        rule(t_mid  * n_safe * a_straight,0.8)
+        rule(t_near * a_straight,         0.6)
+        rule(t_mid  * n_safe * a_straight,0.85)
         rule(t_far  * n_safe * a_straight,1.0)
-        rule(n_mid,                       0.4)
+        rule(t_far  * n_mid  * a_straight,0.7)
+        rule(n_mid,                       0.5)
         rule(a_medium,                    0.5)
-        return num / den if den > 0 else 0.5
+        return num / den if den > 0 else 0.6
 
 
 class FuzzyPID:
@@ -391,15 +392,15 @@ def check_collision(robot_id, target_x, target_y):
     force_x = force_y = 0.0
     min_dist = 999.0
 
-    # 1. Robot-Robot Repulsion
+    # 1. Robot-Robot Repulsion (sadece çok yakınsa)
     for oid, ost in robot_states.items():
         if oid == robot_id or ost["x"] is None: continue
         if robot_id == LEADER_ID: continue
         dx = st["x"] - ost["x"]; dy = st["y"] - ost["y"]
         dist = math.sqrt(dx**2 + dy**2)
         min_dist = min(min_dist, dist)
-        if 0 < dist < 60:
-            s = (500.0 if oid == LEADER_ID else 250.0) / (dist + 1)
+        if 0 < dist < 35:
+            s = (200.0 if oid == LEADER_ID else 120.0) / (dist + 1)
             force_x += (dx / dist) * s; force_y += (dy / dist) * s
 
     # 2. Advanced APF for Obstacles (Repulsive + Tangential/Vortex)
@@ -449,24 +450,24 @@ def drive_robot(robot_id, t_x, t_y, use_pid=True, tolerance=15, slow_mode=False)
     if st["x"] is None:
         return 0, 0
 
-    # Hard Safety Shield: Inter-robot collision avoidance (Warning & Critical Zones)
+    # Hard Safety Shield: Inter-robot collision avoidance (sadece çok yakınsa)
     for oid, ost in robot_states.items():
         if oid != robot_id and ost["x"] is not None:
             dist_o = math.sqrt((ost["x"] - st["x"])**2 + (ost["y"] - st["y"])**2)
-            if dist_o < 48.0:
+            if dist_o < 20.0:
                 angle_to_other = math.degrees(math.atan2(ost["y"] - st["y"], ost["x"] - st["x"])) % 360
                 heading = st["raw_angle"] % 360
                 diff_o = (angle_to_other - heading + 180) % 360 - 180
                 
-                if dist_o < 35.0:
+                if dist_o < 18.0:
                     # CRITICAL ZONE: Actively separate
                     if abs(diff_o) < 90:
-                        return -20, -20  # Back away
+                        return -15, -15  # Back away
                     else:
-                        return 20, 20   # Crawl forward
+                        return 15, 15   # Crawl forward
                 else:
-                    # WARNING ZONE: Stop to shed momentum if heading towards it
-                    if abs(diff_o) < 75:
+                    # WARNING ZONE: Stop only if heading directly at it
+                    if abs(diff_o) < 45:
                         return 0, 0     # Stop
 
     adj_x, adj_y, min_d = check_collision(robot_id, t_x, t_y)
@@ -830,13 +831,12 @@ class ControlThread(threading.Thread):
 
                     if errors:
                         max_err = max(errors)
-                        if max_err > 40.0:
-                            cohesion = max(0.0, 1.0 - (max_err - 40.0) / 40.0)
+                        if max_err > 80.0:
+                            cohesion = max(0.3, 1.0 - (max_err - 80.0) / 80.0)
 
                     coh_log.append((t_rel, cohesion))
-                    if LEADER_ID in robot_commands:
-                        ll, lr = robot_commands[LEADER_ID]
-                        robot_commands[LEADER_ID] = (int(ll * cohesion), int(lr * cohesion))
+                    # Lider her zaman tam güçle gider, cohesion sadece log için
+                    # robot_commands[LEADER_ID] artık yavaşlatılmıyor
 
                 if manual_drive_active:
                     robot_commands[manual_id] = (manual_ls, manual_rs)
