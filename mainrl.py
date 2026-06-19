@@ -1,18 +1,7 @@
-"""
-==============================================================================
- RL REAL-WORLD TRAINER — Swarm Multi-Agent Live GPU Training
-==============================================================================
- Trains 4 Swarm Robots simultaneously with a shared policy (multi-agent).
 
- 3-PHASE OPERATION:
-   ┌─────────────┐    [T]    ┌─────────────┐    [E]    ┌─────────────┐
-   │    SETUP    │ ────────► │  PLANNING   │ ────────► │  EXECUTION  │
-   │ Save start  │           │ Virtual sim │           │ Real motors │
-   │  positions  │           │  No motors  │           │  per-robot  │
-   └─────────────┘           └─────────────┘           └─────────────┘
-               Press [H] at any time to return to SETUP
-==============================================================================
-"""
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 import cv2
 import numpy as np
@@ -222,37 +211,99 @@ LOGIC_GRID_MAX = 400.0
 ROBOTS         = [0, 1, 2, 3]
 ROBOT_COLORS   = {0: (255, 0, 255), 1: (0, 255, 255), 2: (0, 255, 0), 3: (255, 255, 0)}
 
-# Arena boundary (trapezoid / perspective-corrected)
+# Arena boundary (now set to full logical grid since walls are removed)
 WALL_POLYGON = [
-    (350.0,  50.0),
-    (350.0, 350.0),
-    ( 50.0, 290.0),
-    ( 50.0, 110.0)
+    (0.0, 0.0),
+    (LOGIC_GRID_MAX, 0.0),
+    (LOGIC_GRID_MAX, LOGIC_GRID_MAX),
+    (0.0, LOGIC_GRID_MAX)
 ]
-WALL_MIN_X = min(p[0] for p in WALL_POLYGON)
-WALL_MAX_X = max(p[0] for p in WALL_POLYGON)
-WALL_MIN_Y = min(p[1] for p in WALL_POLYGON)
-WALL_MAX_Y = max(p[1] for p in WALL_POLYGON)
+WALL_MIN_X = 0.0
+WALL_MAX_X = LOGIC_GRID_MAX
+WALL_MIN_Y = 0.0
+WALL_MAX_Y = LOGIC_GRID_MAX
 
 def is_point_in_polygon(px, py):
-    inside = False
-    n = len(WALL_POLYGON)
-    for i in range(n):
-        j = (i + 1) % n
-        xi, yi = WALL_POLYGON[i]
-        xj, yj = WALL_POLYGON[j]
-        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-6) + xi):
-            inside = not inside
-    return inside
+    # Since custom walls are removed, any point within grid boundaries is valid
+    return 0.0 <= px <= LOGIC_GRID_MAX and 0.0 <= py <= LOGIC_GRID_MAX
 
 # RL Environment constants
 ARENA_SIZE = 3.0
 POS_SCALE  = ARENA_SIZE / 2.0
 MAX_DIST   = ARENA_SIZE * 1.41
-RL_MOTOR_SCALE = 20
+RL_MOTOR_SCALE = 26
+SPEED_BOOST    = 1.44          # Global motor power for all robots (EXECUTION): +20% on top
+                               # of the previous +20% (1.2 x 1.2) — robots move faster, and
+                               # the extra push may overcome friction on sluggish units.
+GOAL_THRESHOLD = 12.0          # Lock-in radius: robot center must sit right on the point
+APPROACH_DECEL_DIST = 45.0     # Short slow-down zone right before the target (was 70)
+MIN_APPROACH_SCALE  = 0.6      # Floor so the robot still has enough power to reach the goal
 
 virtual_target    = None
+target_assignments = {}
+
+def compute_target_assignments(robot_positions):
+    """
+    Computes optimal one-to-one assignment of robots to target corners.
+    Minimizes the sum of squared distances to find the closest configuration.
+    """
+    global target_assignments
+    target_assignments.clear()
+    
+    if virtual_target is None:
+        return
+        
+    tx, ty = virtual_target
+    offset = 30.0
+    corners = [
+        (tx - offset, ty - offset), # 0: TL
+        (tx + offset, ty - offset), # 1: TR
+        (tx - offset, ty + offset), # 2: BL
+        (tx + offset, ty + offset)  # 3: BR
+    ]
+    
+    # Filter robots that have valid positions
+    rids = [rid for rid in robot_positions if robot_positions[rid] is not None and robot_positions[rid][0] is not None]
+    if not rids:
+        return
+        
+    import itertools
+    best_dist = float('inf')
+    best_perm = None
+    
+    # Check all permutations of assigning len(rids) robots to 4 corners
+    for perm in itertools.permutations(range(4), len(rids)):
+        total_dist_sq = 0
+        for i, rid in enumerate(rids):
+            rx, ry = robot_positions[rid]
+            cx, cy = corners[perm[i]]
+            total_dist_sq += (rx - cx)**2 + (ry - cy)**2
+            
+        if total_dist_sq < best_dist:
+            best_dist = total_dist_sq
+            best_perm = perm
+            
+    if best_perm is not None:
+        for i, rid in enumerate(rids):
+            target_assignments[rid] = best_perm[i]
+
+def get_robot_target(rid):
+    if virtual_target is None:
+        return None
+    offset = 30.0
+    tx, ty = virtual_target
+    corners = [
+        (tx - offset, ty - offset), # 0: TL
+        (tx + offset, ty - offset), # 1: TR
+        (tx - offset, ty + offset), # 2: BL
+        (tx + offset, ty + offset)  # 3: BR
+    ]
+    # Fallback to default if not assigned yet
+    idx = target_assignments.get(rid, rid % 4)
+    return corners[idx]
 virtual_obstacles = []
+manual_obstacles  = []   # User-placed obstacles (right-click) — persistent, not random
+MANUAL_OBS_RADIUS = 12.0
 EMA_ALPHA         = 0.3
 WAITING_FOR_TARGET = False   # True after [T] is pressed — waiting for mouse click
 
@@ -264,7 +315,8 @@ execution_robots_at_goal = set()   # Real robots that reached goal during EXECUT
 def generate_environment(only_obstacles=False):
     """Regenerates obstacles (and optionally the target)."""
     global virtual_target, virtual_obstacles
-    virtual_obstacles.clear()
+    # Start from the user-placed (right-click) obstacles — these are never randomised.
+    virtual_obstacles[:] = list(manual_obstacles)
 
     active_positions = [(robot_states[rid]["nx"], robot_states[rid]["ny"])
                         for rid in ROBOTS if robot_states[rid]["nx"] is not None]
@@ -287,8 +339,9 @@ def generate_environment(only_obstacles=False):
     tx, ty = virtual_target
 
     # ── Obstacle generation ────────────────────────────────────────────────────
-    # Small obstacles (r=5-10, max 2) — placed so they don't block the direct path
-    N_OBSTACLES = 2
+    # Obstacles are now placed manually via RIGHT-CLICK (see mouse_callback).
+    # Random auto-generation is disabled so obstacles appear only where you click.
+    N_OBSTACLES = 0
     for _ in range(N_OBSTACLES):
         for _ in range(80):
             ox = random.uniform(WALL_MIN_X + 20, WALL_MAX_X - 20)
@@ -335,9 +388,35 @@ def generate_environment(only_obstacles=False):
             virtual_obstacles.append((ox, oy, r))
             break
 
+    # After target and obstacles are set, compute the optimal assignments
+    positions = {rid: (robot_states[rid]["nx"], robot_states[rid]["ny"]) 
+                 for rid in ROBOTS}
+    compute_target_assignments(positions)
+
 
 def mouse_callback(event, x, y, flags, param):
-    global virtual_target, fw, fh, WAITING_FOR_TARGET
+    global virtual_target, fw, fh, WAITING_FOR_TARGET, manual_obstacles
+    if event == cv2.EVENT_RBUTTONDOWN:
+        # RIGHT CLICK → place (or remove) an obstacle exactly where clicked
+        if 'fw' not in globals() or 'fh' not in globals():
+            return
+        lx = (x / fw) * LOGIC_GRID_MAX
+        ly = (y / fh) * LOGIC_GRID_MAX
+        if not is_point_in_polygon(lx, ly):
+            Log.warning("Obstacle point is outside the arena!")
+            return
+        # If clicking on an existing obstacle, remove it instead of adding a new one
+        for i, (ox, oy, orr) in enumerate(manual_obstacles):
+            if math.hypot(ox - lx, oy - ly) <= orr + 8:
+                manual_obstacles.pop(i)
+                virtual_obstacles[:] = list(manual_obstacles)
+                Log.info(f"Obstacle removed. (total {len(manual_obstacles)})")
+                return
+        manual_obstacles.append((lx, ly, MANUAL_OBS_RADIUS))
+        virtual_obstacles.append((lx, ly, MANUAL_OBS_RADIUS))
+        Log.info(f"Obstacle placed: ({lx:.1f}, {ly:.1f})  (total {len(manual_obstacles)})")
+        return
+
     if event == cv2.EVENT_LBUTTONDOWN:
         if 'fw' not in globals() or 'fh' not in globals():
             return
@@ -362,7 +441,8 @@ robot_states = {rid: {
     "last_seen_time": time.time(), "RL_STATE": "COMPUTE",
     "action_send_time": 0, "current_action": [0.0, 0.0],
     "ep_reward": 0, "ep_steps": 0, "prev_d": None,
-    "wall_bounce_target": (200.0, 200.0), "episode": 1
+    "wall_bounce_target": (200.0, 200.0), "episode": 1,
+    "pos_history": deque(maxlen=10)
 } for rid in ROBOTS}
 
 
@@ -460,15 +540,17 @@ def _build_obs_reward(rid, nx, ny, angle, prev_dist=None, prev_action=None, over
     nx, ny, angle: robot position (real or virtual).
     Returns: (obs, reward, done, dist_to_target)
     """
-    if nx is None or virtual_target is None:
+    rtarget = get_robot_target(rid)
+    if nx is None or rtarget is None:
         return None, 0.0, False, None
 
+    rtx, rty = rtarget
     px = (nx / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
     py = (ny / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
-    gx = (virtual_target[0] / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
-    gy = (virtual_target[1] / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
+    gx = (rtx / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
+    gy = (rty / LOGIC_GRID_MAX) * ARENA_SIZE - (ARENA_SIZE / 2.0)
 
-    dist_logic  = math.sqrt((virtual_target[0] - nx)**2 + (virtual_target[1] - ny)**2)
+    dist_logic  = math.sqrt((rtx - nx)**2 + (rty - ny)**2)
     dist_metric = min(math.sqrt((gx - px)**2 + (gy - py)**2), MAX_DIST)
 
     target_angle_rad = math.atan2(gy - py, gx - px)
@@ -500,8 +582,8 @@ def _build_obs_reward(rid, nx, ny, angle, prev_dist=None, prev_action=None, over
         progress = prev_dist - dist_logic
         reward  += progress * 1.0
 
-    # GOAL reached
-    if dist_logic < (robot_radius + 15):
+    # GOAL reached (within vicinity of the target)
+    if dist_logic < GOAL_THRESHOLD:
         reward += 100.0
         done    = True
 
@@ -513,6 +595,11 @@ def _build_obs_reward(rid, nx, ny, angle, prev_dist=None, prev_action=None, over
             break
 
     # INTER-ROBOT proximity penalty (virtual or real positions)
+    # RELAXED near the goal: the 4 target corners are deliberately only ~60px apart,
+    # so robots MUST settle side-by-side. Punishing closeness there made the policy
+    # learn to AVOID the target cluster (reward stayed negative, never converged).
+    # While "parking" (close to own corner) we only penalise a real overlap, lightly.
+    parking_reward = dist_logic < APPROACH_DECEL_DIST
     for oid in ROBOTS:
         if oid != rid:
             if override_positions and oid in override_positions:
@@ -522,17 +609,22 @@ def _build_obs_reward(rid, nx, ny, angle, prev_dist=None, prev_action=None, over
             else:
                 continue
             dist_o = math.sqrt((onx - nx)**2 + (ony - ny)**2)
-            if dist_o < 35.0:
-                reward -= (35.0 - dist_o)
-            if dist_o < 22.0:
-                reward -= 50.0
-                done    = True
-                break
+            if parking_reward:
+                # Near goal — only a gentle nudge if robots genuinely overlap
+                if dist_o < 18.0:
+                    reward -= (18.0 - dist_o) * 0.5
+            else:
+                # In transit — full collision avoidance
+                if dist_o < 35.0:
+                    reward -= (35.0 - dist_o)
+                if dist_o < 22.0:
+                    reward -= 50.0
+                    # done    = True  # Removed so they don't terminate episode immediately on bump
 
     # WALL collision penalty
     if not is_point_in_polygon(nx, ny):
         reward -= 50.0
-        done    = True
+        # done    = True  # Removed as requested
 
     return obs, reward, done, dist_logic
 
@@ -560,7 +652,7 @@ def get_virtual_obs_reward(rid, vst, prev_dist=None, prev_action=None, all_vst=N
 #  VIRTUAL PHYSICS ENGINE (PLANNING PHASE)
 # ==============================================================================
 SIM_DT          = 0.04    # Virtual step duration (seconds)
-SIM_SPEED_SCALE = 26.0    # RL action → pixels/step
+SIM_SPEED_SCALE = 34.0    # RL action → pixels/step
 
 
 def virtual_step(vst, action):
@@ -597,14 +689,16 @@ def connect_serial_port():
         gateway_serial.dtr = False
         gateway_serial.rts = False
         Log.success(f"Connected to serial port {GATEWAY_PORT}!")
-    except:
-        pass
+    except Exception as e:
+        Log.error(f"Serial port {GATEWAY_PORT} connection FAILED: {e}")
+        Log.warning("Motor commands will NOT be sent! Check COM port.")
 
 def send_robot_command(rid, left, right):
     if gateway_serial and gateway_serial.is_open:
         cmd = f"<{rid},{int(left)},{int(right)}>\n"
         gateway_serial.write(cmd.encode('utf-8'))
         gateway_serial.flush()
+        time.sleep(0.005)  # Give Arduino time to process and avoid buffer overflow
 
 connect_serial_port()
 
@@ -625,20 +719,21 @@ start_positions = {}
 # {rid: {nx, ny, angle, prev_d, action, ep_steps, episode, ep_reward}}
 virtual_robot_states = {}
 
-# PLANNING parameters
-PLANNING_MIN_EPISODES  = 20     # Minimum episodes before convergence check
-PLANNING_MAX_EPISODES  = 500    # Maximum episodes (safety cap if no convergence)
-PPO_UPDATE_TIMESTEP    = 1600   # Update PPO every N virtual steps (buffer size)
-MAX_EP_STEPS           = 400    # Maximum steps per episode
+# PLANNING parameters (Tuned for longer, higher-quality training)
+PLANNING_MIN_EPISODES  = 120    # Minimum episodes before convergence check (was 50)
+PLANNING_MAX_EPISODES  = 400    # Maximum episodes (safety cap if no convergence)
+PPO_UPDATE_TIMESTEP    = 800    # Update PPO every N virtual steps (smaller = faster updates)
+MAX_EP_STEPS           = 200    # Maximum steps per episode (shorter = faster learning)
 
 # Convergence criteria
 CONVERGENCE_WINDOW     = 20     # Number of recent episodes for moving average
-CONVERGENCE_THRESHOLD  = 60.0   # Avg reward above this → "learned"
-CONVERGENCE_STREAK     = 3      # Consecutive PPO updates above threshold needed
+CONVERGENCE_THRESHOLD  = 120.0  # Avg reward above this → "learned" (raised from 75; observed ~152)
+CONVERGENCE_STREAK     = 8      # Consecutive PPO updates above threshold needed (was 6)
 
 planning_total_episodes = 0     # Total episodes completed in PLANNING phase
 plan_update_pending     = False
 convergence_streak_count = 0    # Consecutive updates above convergence threshold
+planning_converged      = False # True once training is done — waits for user to press [E]
 
 
 def _banner(message, color=None):
@@ -724,11 +819,23 @@ def _start_planning():
     """
     global SYSTEM_PHASE, planning_total_episodes, plan_update_pending
     global global_time_step, convergence_streak_count, plan_robots_at_goal
+    global planning_converged
 
     init_virtual_states()
+    
+    # For training: assign corners based on start positions
+    positions = {}
+    for rid in ROBOTS:
+        if rid in start_positions:
+            positions[rid] = (start_positions[rid][0], start_positions[rid][1])
+        else:
+            positions[rid] = (200.0, 200.0)
+    compute_target_assignments(positions)
+
     planning_total_episodes  = 0
     convergence_streak_count = 0
     plan_update_pending      = False
+    planning_converged       = False
     plan_robots_at_goal.clear()
     for rm in robot_memories.values():
         rm.clear()
@@ -770,10 +877,36 @@ def enter_execution():
         robot_states[rid]["action_send_time"] = 0
         robot_states[rid]["ep_steps"]        = 0
         robot_states[rid]["ep_reward"]       = 0
+        
+    # Assign corners based on current real-world positions of visible robots
+    positions = {rid: (robot_states[rid]["nx"], robot_states[rid]["ny"]) 
+                 for rid in ROBOTS}
+    compute_target_assignments(positions)
+    
     SYSTEM_PHASE = 'EXECUTION'
     phase_log.append({"t": time.time() - _plot_start,
                       "from_p": "PLANNING", "to_p": "EXECUTION",
                       "ep_count": planning_total_episodes})
+
+    # Diagnostic: show which robots are visible and their positions
+    Log.info("── EXECUTION ROBOT STATUS ──")
+    for rid in ROBOTS:
+        st = robot_states[rid]
+        if st["nx"] is not None:
+            inside = is_point_in_polygon(st["nx"], st["ny"])
+            Log.success(f"  R{rid}: pos=({st['nx']:.1f}, {st['ny']:.1f}) "
+                        f"angle={st['angle']}° "
+                        f"inside_arena={'YES' if inside else 'NO'}")
+        else:
+            Log.error(f"  R{rid}: NOT VISIBLE (nx=None) — will not move!")
+    if gateway_serial and gateway_serial.is_open:
+        Log.success(f"  Serial: {GATEWAY_PORT} CONNECTED")
+    else:
+        Log.error(f"  Serial: NOT CONNECTED — motors will not respond!")
+    if virtual_target:
+        Log.info(f"  Target: ({virtual_target[0]:.1f}, {virtual_target[1]:.1f})")
+    else:
+        Log.error(f"  Target: NOT SET — heading correction disabled!")
 
     _banner(
         f"► EXECUTION STARTED\n"
@@ -787,6 +920,7 @@ def enter_execution():
 def enter_setup():
     """Return to SETUP from any phase."""
     global SYSTEM_PHASE, plan_robots_at_goal, execution_robots_at_goal
+    global planning_converged
     previous_phase = SYSTEM_PHASE
     stop_all_robots()
     SYSTEM_PHASE = 'SETUP'
@@ -797,6 +931,7 @@ def enter_setup():
     virtual_robot_states.clear()
     plan_robots_at_goal.clear()
     execution_robots_at_goal.clear()
+    planning_converged = False
 
     _banner(
         f"↺  SYSTEM RESET\n"
@@ -807,25 +942,153 @@ def enter_setup():
     )
 
 
+def _heading_correction(rid):
+    """
+    Proportional heading-correction controller.
+    Returns (left_motor, right_motor) that steer the robot toward the target.
+    Used as a safety net when the RL policy output is too weak.
+    """
+    st = robot_states[rid]
+    rtarget = get_robot_target(rid)
+    if st["nx"] is None or st["angle"] is None or rtarget is None:
+        return 0, 0
+
+    rtx, rty = rtarget
+    dx = rtx - st["nx"]
+    dy = rty - st["ny"]
+    dist = math.sqrt(dx**2 + dy**2)
+
+    if dist < GOAL_THRESHOLD:   # Already at target vicinity
+        return 0, 0
+
+    # Angle from robot to target (degrees, 0-360)
+    target_angle = math.degrees(math.atan2(dy, dx)) % 360
+    heading      = st["angle"] % 360
+
+    # Signed angle error: positive = target is to the right, negative = left
+    diff = (target_angle - heading + 180) % 360 - 180
+
+    # Forward speed: base 24 (increased by ~30%), reduced when facing away from target
+    fwd = int(24 * max(0.0, math.cos(math.radians(diff))))
+
+    # Turning speed: proportional to angle error
+    if abs(diff) > 60:
+        # Big angle error: spin in place
+        turn = 24 if diff > 0 else -24
+        return turn, -turn
+    else:
+        turn = int(np.clip(diff * 0.45, -20, 20))
+        return fwd + turn, fwd - turn
+
+
 def execute_learned_policy(rid):
     """
-    EXECUTION phase: generate and send a per-robot motor command using the learned policy.
-    No exploration — deterministic mean action.
+    EXECUTION phase: HYBRID controller.
+    Blends RL policy output with proportional heading-correction.
+    If the policy is well-trained, RL dominates.
+    If the policy is weak (near-zero output), heading-correction takes over.
     """
     global execution_robots_at_goal
     st = robot_states[rid]
-    if st["nx"] is None:
+    if st["nx"] is None or st["angle"] is None:
         return
+
+    # 1. If this robot has already reached the goal, keep it stopped
+    if rid in execution_robots_at_goal:
+        send_robot_command(rid, 0, 0)
+        return
+
+    # 2. If this robot is very close to another robot that has already reached the goal,
+    # count this robot as reached as well to prevent collision near target.
+    for oid in execution_robots_at_goal:
+        if oid != rid:
+            onx, ony = robot_states[oid]["nx"], robot_states[oid]["ny"]
+            if onx is not None and st["nx"] is not None:
+                dist_to_reached = math.sqrt((onx - st["nx"])**2 + (ony - st["ny"])**2)
+                if dist_to_reached < GOAL_THRESHOLD:
+                    Log.success(f"[EXEC] R{rid} stopped near stationary R{oid} (at target) to prevent collision.")
+                    execution_robots_at_goal.add(rid)
+                    send_robot_command(rid, 0, 0)
+                    return
+
+    # 3. Inter-robot collision avoidance shield (push-apart only, NO full-stop):
+    # The old WARN zone sent (0,0) when robots were merely near each other. With 4 robots
+    # clustered at the start, every robot froze waiting for the others → permanent deadlock
+    # ("they don't even move"). We now ONLY react inside the tight CRITICAL zone, and we
+    # react by MOVING (push apart) — so a robot is never frozen; it either heads to its
+    # goal or actively separates. CRIT shrinks while parking (corners are ~60px apart).
+    _rt = get_robot_target(rid)
+    _own_dist = math.hypot(_rt[0] - st["nx"], _rt[1] - st["ny"]) if _rt else 1e9
+    parking = (_own_dist < APPROACH_DECEL_DIST)
+    CRIT_ZONE = 18.0 if parking else 26.0   # actively push apart only when truly close
+    for oid in ROBOTS:
+        if oid != rid:
+            onx, ony = robot_states[oid]["nx"], robot_states[oid]["ny"]
+            if onx is not None and st["nx"] is not None and oid not in execution_robots_at_goal:
+                dist_o = math.sqrt((onx - st["nx"])**2 + (ony - st["ny"])**2)
+                if dist_o < CRIT_ZONE:
+                    angle_to_other = math.degrees(math.atan2(ony - st["ny"], onx - st["nx"])) % 360
+                    heading = st["angle"] % 360
+                    diff_o = (angle_to_other - heading + 180) % 360 - 180
+                    if abs(diff_o) < 90:
+                        Log.warning(f"[CRITICAL SAFETY] R{rid} backing away from active R{oid} (dist: {dist_o:.1f}px)")
+                        send_robot_command(rid, -22, -22)
+                    else:
+                        Log.warning(f"[CRITICAL SAFETY] R{rid} escaping forward from R{oid} (dist: {dist_o:.1f}px)")
+                        send_robot_command(rid, 22, 22)
+                    return
 
     # Get observation from real camera position
     obs, _, done, d = get_observation_and_reward(rid, st["prev_d"], st["current_action"])
     if obs is None:
         return
 
-    # Deterministic action (no exploration)
+    # ── RL policy action ──
     action = ppo_agent.select_action_deterministic(obs)
-    ls = int(np.clip(action[0] * RL_MOTOR_SCALE, -30, 30))
-    rs = int(np.clip(action[1] * RL_MOTOR_SCALE, -30, 30))
+    rl_ls = action[0] * RL_MOTOR_SCALE   # float, not clipped yet
+    rl_rs = action[1] * RL_MOTOR_SCALE
+
+    # ── Heading-correction fallback ──
+    hc_ls, hc_rs = _heading_correction(rid)
+
+    # ── Blend: heading-correction LEADS, RL only nudges ──
+    # The RL policy learns in the virtual sim but does NOT transfer reliably to the real
+    # robots (it was driving them BACKWARD, away from the target). The heading-correction
+    # controller is a simple, correct P-controller that always steers FORWARD toward the
+    # target, so we let it dominate and cap the RL contribution to a small nudge (<=25%).
+    rl_mag = (abs(rl_ls) + abs(rl_rs)) / 2.0
+    rl_weight = min(0.25, rl_mag / 80.0)   # RL at most 25%; HC always >= 75%
+    hc_weight = 1.0 - rl_weight
+
+    ls_raw = rl_ls * rl_weight + hc_ls * hc_weight
+    rs_raw = rl_rs * rl_weight + hc_rs * hc_weight
+
+    # ── Smooth deceleration near target (gentle parking, no slalom) ──
+    # Both motors are scaled by the SAME factor, so the left/right ratio — and thus
+    # the heading — is unchanged; only the overall speed eases down as it closes in.
+    # (Damping only the forward component caused zig-zag, so we scale uniformly.)
+    if d is not None and d < APPROACH_DECEL_DIST:
+        decel   = max(MIN_APPROACH_SCALE, d / APPROACH_DECEL_DIST)
+        ls_raw *= decel
+        rs_raw *= decel
+
+    # Stuck Detection (Anti-Friction Takeoff Boost)
+    # Check the robot's real movement over the last 10 execution frames (~0.5 seconds)
+    st["pos_history"].append((st["nx"], st["ny"]))
+    boost = 1.0
+    if len(st["pos_history"]) == st["pos_history"].maxlen:
+        old_x, old_y = st["pos_history"][0]
+        movement = math.sqrt((st["nx"] - old_x)**2 + (st["ny"] - old_y)**2)
+        # If we command non-zero speed but movement is virtually zero, apply +25% extra power.
+        # Skip while in the deceleration zone — there slow movement is intentional, not stuck.
+        in_decel = (d is not None and d < APPROACH_DECEL_DIST)
+        if (not in_decel) and (abs(ls_raw) > 5.0 or abs(rs_raw) > 5.0) and movement < 2.0:
+            boost = 1.25
+            Log.warning(f"[ANTI-FRICTION] R{rid} is stuck (moved only {movement:.2f}px in 0.5s). Applying +25% power boost!")
+
+    ls = int(np.clip(ls_raw * boost * SPEED_BOOST, -60, 60))
+    rs = int(np.clip(rs_raw * boost * SPEED_BOOST, -60, 60))
+
     send_robot_command(rid, ls, rs)
     execution_log.append({
         "t": time.time() - _plot_start, "rid": rid,
@@ -840,28 +1103,34 @@ def execute_learned_policy(rid):
 
     if st["ep_steps"] % 6 == 0:
         Log.info(f"[EXEC] R{rid} | Step:{st['ep_steps']} | "
-                 f"Dist to target:{d:.1f} | L:{ls} R:{rs}")
+                 f"Dist:{d:.1f} | RL({rl_ls:.1f},{rl_rs:.1f}) "
+                 f"HC({hc_ls},{hc_rs}) W:{rl_weight:.2f} → L:{ls} R:{rs}")
 
-    if done:
+    # Check actual distance to target vicinity instead of pinpoint
+    is_goal = (d is not None and d < GOAL_THRESHOLD)
+    
+    if is_goal:
         if execution_log and execution_log[-1]["rid"] == rid:
             execution_log[-1]["done"] = True
-        execution_robots_at_goal.add(rid)
-        Log.success(f"[EXEC] Robot {rid} REACHED TARGET! "
-                    f"({len(execution_robots_at_goal)}/{len(ROBOTS)} robots at goal)")
+        if rid not in execution_robots_at_goal:
+            execution_robots_at_goal.add(rid)
+            Log.success(f"[EXEC] Robot {rid} REACHED TARGET! "
+                        f"({len(execution_robots_at_goal)}/{len(ROBOTS)} robots at goal)")
         st["ep_steps"] = 0
         st["prev_d"]   = None
 
-        # If all visible robots reached goal, refresh obstacles only
+        # Stop the robot immediately and keep it stopped — no loop, no re-targeting.
+        send_robot_command(rid, 0, 0)
+
+        # If all visible robots reached goal, just announce it. Robots STAY stopped.
         active_robots = {r for r in ROBOTS if robot_states[r]["nx"] is not None}
         if active_robots and execution_robots_at_goal >= active_robots:
-            Log.success("[EXEC] ALL ROBOTS REACHED TARGET! Refreshing obstacles...")
-            generate_environment(only_obstacles=True)
-            execution_robots_at_goal.clear()
+            Log.success("[EXEC] ALL ROBOTS REACHED TARGET! Mission complete — robots holding position.")
 
 # ==============================================================================
 #  TRAINING & RUNTIME VARIABLES
 # ==============================================================================
-camera = LatencyFreeCamera("http://192.168.1.177:8080/video")
+camera = LatencyFreeCamera("http://172.22.179.169:8080/video")
 
 ppo_agent     = PPO(obs_dim=16, action_dim=2, lr=0.0003)
 train_memory  = RolloutBuffer()
@@ -992,83 +1261,89 @@ try:
         # ──────────────────────────────────────────────
         # 2A. PLANNING PHASE — Virtual Simulation (No Motors)
         # ──────────────────────────────────────────────
-        if SYSTEM_PHASE == 'PLANNING' and not e_stop_active and not plan_update_pending:
+        if (SYSTEM_PHASE == 'PLANNING' and not e_stop_active
+                and not plan_update_pending and not planning_converged):
 
-            for rid in ROBOTS:
-                if rid not in virtual_robot_states:
-                    continue
-                vst = virtual_robot_states[rid]
+            for _fast_forward in range(50):
+                for rid in ROBOTS:
+                    if rid not in virtual_robot_states:
+                        continue
+                    vst = virtual_robot_states[rid]
 
-                # Get observation (from virtual position)
-                obs, _, _, _ = get_virtual_obs_reward(
-                    rid, vst, vst["prev_d"], vst["action"], virtual_robot_states)
-                if obs is None:
-                    continue
+                    # Get observation (from virtual position)
+                    obs, _, _, _ = get_virtual_obs_reward(
+                        rid, vst, vst["prev_d"], vst["action"], virtual_robot_states)
+                    if obs is None:
+                        continue
 
-                # Select RL action (with exploration — training)
-                action     = ppo_agent.select_action(obs, robot_memories[rid])
-                vst["action"] = action
+                    # Select RL action (with exploration — training)
+                    action     = ppo_agent.select_action(obs, robot_memories[rid])
+                    vst["action"] = action
 
-                # Virtual step (NO real motor command)
-                virtual_step(vst, action)
-                if len(virt_pos_log) < 120000:
-                    virt_pos_log.append({"ep": vst["episode"], "rid": rid,
-                                         "nx": vst["nx"], "ny": vst["ny"]})
+                    # Virtual step (NO real motor command)
+                    virtual_step(vst, action)
+                    if len(virt_pos_log) < 120000:
+                        virt_pos_log.append({"ep": vst["episode"], "rid": rid,
+                                             "nx": vst["nx"], "ny": vst["ny"]})
 
-                # New obs + reward
-                _, reward, done, new_d = get_virtual_obs_reward(
-                    rid, vst, vst["prev_d"], action, virtual_robot_states)
+                    # New obs + reward
+                    _, reward, done, new_d = get_virtual_obs_reward(
+                        rid, vst, vst["prev_d"], action, virtual_robot_states)
 
-                robot_memories[rid].rewards.append(reward)
-                robot_memories[rid].is_terminals.append(done)
+                    robot_memories[rid].rewards.append(reward)
+                    robot_memories[rid].is_terminals.append(done)
 
-                vst["prev_d"]    = new_d
-                vst["ep_reward"] += reward
-                vst["ep_steps"]  += 1
-                global_time_step  += 1
+                    vst["prev_d"]    = new_d
+                    vst["ep_reward"] += reward
+                    vst["ep_steps"]  += 1
+                    global_time_step  += 1
 
-                # If virtual robot reached target, refresh obstacles
-                if done and new_d is not None and new_d < (robot_states[rid]["radius"] + 15):
-                    Log.plan(f"[PLAN] R{rid} reached virtual target! Refreshing obstacles...")
-                    generate_environment(only_obstacles=True)
-                    plan_robots_at_goal.clear()
+                    # If virtual robot reached target, refresh obstacles
+                    if done and new_d is not None and new_d < (robot_states[rid]["radius"] + 15):
+                        Log.plan(f"[PLAN] R{rid} reached virtual target! Refreshing obstacles...")
+                        generate_environment(only_obstacles=True)
+                        plan_robots_at_goal.clear()
 
-                # Episode ended?
-                if done or vst["ep_steps"] >= MAX_EP_STEPS:
-                    Log.plan(f"[PLAN] R{rid} Ep:{vst['episode']} DONE | "
-                             f"Reward:{vst['ep_reward']:.1f}")
+                    # Episode ended?
+                    if done or vst["ep_steps"] >= MAX_EP_STEPS:
+                        if planning_total_episodes % 10 == 0:
+                            Log.plan(f"[PLAN] R{rid} Ep:{vst['episode']} DONE | "
+                                     f"Reward:{vst['ep_reward']:.1f}")
 
-                    robot_memories[rid].compute_returns(ppo_agent.gamma)
-                    train_memory.states.extend(robot_memories[rid].states)
-                    train_memory.actions.extend(robot_memories[rid].actions)
-                    train_memory.logprobs.extend(robot_memories[rid].logprobs)
-                    train_memory.rewards.extend(robot_memories[rid].rewards)
-                    train_memory.is_terminals.extend(robot_memories[rid].is_terminals)
-                    train_memory.returns.extend(robot_memories[rid].returns)
-                    robot_memories[rid].clear()
+                        robot_memories[rid].compute_returns(ppo_agent.gamma)
+                        train_memory.states.extend(robot_memories[rid].states)
+                        train_memory.actions.extend(robot_memories[rid].actions)
+                        train_memory.logprobs.extend(robot_memories[rid].logprobs)
+                        train_memory.rewards.extend(robot_memories[rid].rewards)
+                        train_memory.is_terminals.extend(robot_memories[rid].is_terminals)
+                        train_memory.returns.extend(robot_memories[rid].returns)
+                        robot_memories[rid].clear()
 
-                    episode_rewards_history.append(vst["ep_reward"])
-                    episode_log.append({
-                        "ep": planning_total_episodes, "rid": rid,
-                        "reward": vst["ep_reward"], "steps": vst["ep_steps"],
-                        "phase": "PLANNING"
-                    })
-                    planning_total_episodes += 1
-                    vst["episode"]   += 1
-                    vst["ep_reward"]  = 0.0
-                    vst["ep_steps"]   = 0
-                    vst["prev_d"]     = None
+                        episode_rewards_history.append(vst["ep_reward"])
+                        episode_log.append({
+                            "ep": planning_total_episodes, "rid": rid,
+                            "reward": vst["ep_reward"], "steps": vst["ep_steps"],
+                            "phase": "PLANNING"
+                        })
+                        planning_total_episodes += 1
+                        vst["episode"]   += 1
+                        vst["ep_reward"]  = 0.0
+                        vst["ep_steps"]   = 0
+                        vst["prev_d"]     = None
 
-                    # Reset to start position with randomised heading
-                    if rid in start_positions:
-                        vst["nx"], vst["ny"], _ = start_positions[rid]
-                    else:
-                        vst["nx"], vst["ny"] = 200.0, 200.0
-                    vst["angle"] = random.uniform(0, 360)
+                        # Reset to start position with randomised heading
+                        if rid in start_positions:
+                            vst["nx"], vst["ny"], _ = start_positions[rid]
+                        else:
+                            vst["nx"], vst["ny"] = 200.0, 200.0
+                        vst["angle"] = random.uniform(0, 360)
 
-                # Trigger PPO update when buffer is full
-                if len(train_memory.states) >= PPO_UPDATE_TIMESTEP:
-                    plan_update_pending = True
+                    # Trigger PPO update when buffer is full
+                    if len(train_memory.states) >= PPO_UPDATE_TIMESTEP:
+                        plan_update_pending = True
+
+                if plan_update_pending:
+                    break
 
             # PPO network update
             if plan_update_pending:
@@ -1138,7 +1413,15 @@ try:
                     else f"Max episodes ({PLANNING_MAX_EPISODES}) exceeded"
                 )
                 Log.success(f"[CONVERGENCE] Criterion: {reason}")
-                enter_execution()
+                # Do NOT auto-switch — freeze training and wait for the user to press [E].
+                planning_converged = True
+                stop_all_robots()
+                _banner(
+                    f"✔  TRAINING COMPLETE\n"
+                    f"{planning_total_episodes} episodes finished.\n"
+                    f">>> PRESS [E] TO START EXECUTION <<<",
+                    Log.GREEN
+                )
 
         # ──────────────────────────────────────────────
         # 2B. EXECUTION PHASE — Per-Robot Deterministic Command
@@ -1150,12 +1433,6 @@ try:
                     if (current_time - st["action_send_time"]) > 0.5:
                         send_robot_command(rid, 0, 0)
                         st["action_send_time"] = current_time
-                    continue
-
-                # Stop robot if it goes outside the arena boundary
-                if not is_point_in_polygon(st["nx"], st["ny"]):
-                    Log.warning(f"[EXEC] Robot {rid} out of bounds! Stopping...")
-                    send_robot_command(rid, 0, 0)
                     continue
 
                 # Limit command rate to ~20 Hz
@@ -1179,9 +1456,6 @@ try:
             poly_pts.append([int((lx / LOGIC_GRID_MAX) * fw),
                              int((ly / LOGIC_GRID_MAX) * fh)])
         cv2.polylines(display, [np.array(poly_pts)], True, (0, 0, 255), 2)
-        cv2.putText(display, "ARENA WALL",
-                    (poly_pts[0][0] - 20, poly_pts[0][1] - 10),
-                    FONT, 0.5, (0, 0, 255), 2)
 
         # Draw real robots
         for rid in ROBOTS:
@@ -1251,6 +1525,20 @@ try:
             cv2.drawMarker(display, (tx_, ty_), (255, 200, 0), cv2.MARKER_CROSS, 30, 3)
             cv2.putText(display, "TARGET",
                         (tx_ - 20, ty_ - 20), FONT, 0.6, (255, 200, 0), 2)
+            
+            # Draw parking target square around the center
+            offset_px = int((30.0 / LOGIC_GRID_MAX) * fw)
+            cv2.rectangle(display, 
+                          (tx_ - offset_px, ty_ - offset_px), 
+                          (tx_ + offset_px, ty_ + offset_px), 
+                          (255, 255, 255), 1, cv2.LINE_AA)
+            # Draw corner markers for each robot target
+            for rid in ROBOTS:
+                rt = get_robot_target(rid)
+                if rt:
+                    rx_ = int((rt[0] / LOGIC_GRID_MAX) * fw)
+                    ry_ = int((rt[1] / LOGIC_GRID_MAX) * fh)
+                    cv2.circle(display, (rx_, ry_), 4, ROBOT_COLORS[rid], -1, cv2.LINE_AA)
 
         for (ox, oy, r) in virtual_obstacles:
             ecx = int((ox / LOGIC_GRID_MAX) * fw)
@@ -1270,6 +1558,12 @@ try:
             phase_str, phase_clr = ">>> LEFT CLICK TO SELECT TARGET <<<", (0, 200, 255)
         elif SYSTEM_PHASE == 'SETUP':
             phase_str, phase_clr = "SETUP — [T] to start Planning", (0, 200, 255)
+        elif SYSTEM_PHASE == 'PLANNING' and planning_converged:
+            phase_str, phase_clr = (
+                f"TRAINING DONE ({planning_total_episodes} ep) "
+                f">>> PRESS [E] TO START EXECUTION <<<",
+                (0, 255, 255)
+            )
         elif SYSTEM_PHASE == 'PLANNING':
             phase_str, phase_clr = (
                 f"PLANNING — Virtual Sim "
@@ -1322,7 +1616,7 @@ try:
                         f"MANUAL: Robot:{selected_manual_robot} (0-3 select, WASD drive)",
                         (10, fh - 45), FONT, 0.5, (255, 150, 150), 2)
         cv2.putText(display,
-                    "[T]Plan [E]Execute [H]Setup [SPACE]E-Stop [R]Map [Q]Quit",
+                    "[T]Plan [E/F]Execute [H]Setup [SPACE]E-Stop [R]Map [Q]Quit",
                     (10, fh - 20), FONT, 0.45, (255, 255, 255), 1)
 
         cv2.imshow('MULTI_AGENT_RL', display)
@@ -1353,11 +1647,38 @@ try:
                 else:
                     Log.warning("EXECUTION is active. Press [H] to return to SETUP first.")
 
-        elif key == ord('e'):   # PLANNING → EXECUTION (manual override)
+        elif key == ord('e') or key == ord('f'):   # PLANNING → EXECUTION (manual override)
             if not e_stop_active:
                 if SYSTEM_PHASE == 'PLANNING':
-                    Log.success(f"Manual EXECUTION switch! "
-                                f"({planning_total_episodes} eps completed)")
+                    # Flush remaining buffer with a final PPO update
+                    if len(train_memory.states) > 0:
+                        Log.plan(f"[F] Final PPO flush | Buffer:{len(train_memory.states)}")
+                        try:
+                            # Finalize any incomplete robot episodes into train_memory
+                            for _rid in ROBOTS:
+                                rm = robot_memories[_rid]
+                                if len(rm.states) > 0:
+                                    rm.rewards.append(0.0)
+                                    rm.is_terminals.append(True)
+                                    rm.compute_returns(ppo_agent.gamma)
+                                    train_memory.states.extend(rm.states)
+                                    train_memory.actions.extend(rm.actions)
+                                    train_memory.logprobs.extend(rm.logprobs)
+                                    train_memory.rewards.extend(rm.rewards)
+                                    train_memory.is_terminals.extend(rm.is_terminals)
+                                    train_memory.returns.extend(rm.returns)
+                                    rm.clear()
+                            if len(train_memory.states) > 0:
+                                last_loss = ppo_agent.update(train_memory)
+                                train_memory.clear()
+                                update_count += 1
+                                torch.save(ppo_agent.policy.state_dict(), MODEL_SAVE_PATH)
+                                Log.success(f"Final update done | Loss:{last_loss:.4f}")
+                        except Exception as _fe:
+                            Log.error(f"Final flush error: {_fe}")
+                            train_memory.clear()
+                    Log.success(f">>> [F] SKIP TO EXECUTION! "
+                                f"({planning_total_episodes} eps completed) <<<")
                     enter_execution()
                 elif SYSTEM_PHASE == 'SETUP':
                     Log.warning("Run [T] to start PLANNING first!")
@@ -1383,10 +1704,10 @@ try:
         # Manual WASD — only in SETUP phase
         if SYSTEM_PHASE == 'SETUP' and not e_stop_active:
             if key in [ord('w'), ord('a'), ord('s'), ord('d')]:
-                if   key == ord('w'): send_robot_command(selected_manual_robot,  20,  20)
-                elif key == ord('s'): send_robot_command(selected_manual_robot, -20, -20)
-                elif key == ord('a'): send_robot_command(selected_manual_robot, -18,  18)
-                elif key == ord('d'): send_robot_command(selected_manual_robot,  18, -18)
+                if   key == ord('w'): send_robot_command(selected_manual_robot,  26,  26)
+                elif key == ord('s'): send_robot_command(selected_manual_robot, -26, -26)
+                elif key == ord('a'): send_robot_command(selected_manual_robot, -24,  24)
+                elif key == ord('d'): send_robot_command(selected_manual_robot,  24, -24)
                 manual_motor_active = True
                 manual_last_cmd     = current_time
             else:
@@ -1411,8 +1732,12 @@ finally:
         print("  SIMULATION ENDED — GENERATING 25 PLOTS...")
         print("=" * 65)
 
-        OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_plots")
+        # Each run writes into its own timestamped subfolder inside rl_plots,
+        # so previous runs' plots are never overwritten.
+        PLOTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_plots")
+        OUT_DIR    = os.path.join(PLOTS_ROOT, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(OUT_DIR, exist_ok=True)
+        print(f"  Output folder: {OUT_DIR}")
 
         ROBOT_HEX = {0: "#e41a1c", 1: "#377eb8", 2: "#4daf4a", 3: "#ff7f00"}
         C_PLAN    = "#1f77b4"
@@ -1669,7 +1994,7 @@ finally:
                             color=ROBOT_HEX[rid], lw=1.8, alpha=0.85,
                             label=f"Robot {rid}")
             ax.axhline(0, color="#aaaaaa", lw=1, ls="--")
-            ax.set_ylim(-35, 35)
+            ax.set_ylim(-45, 45)
             ax.set_xlabel("Time (s)"); ax.set_ylabel("Left Motor Command")
             ax.set_title("EXECUTION — Left Motor Command Time Series"); ax.legend()
             _save(fig, "12_execution_motor_left")
@@ -1686,7 +2011,7 @@ finally:
                             color=ROBOT_HEX[rid], lw=1.8, alpha=0.85,
                             label=f"Robot {rid}")
             ax.axhline(0, color="#aaaaaa", lw=1, ls="--")
-            ax.set_ylim(-35, 35)
+            ax.set_ylim(-45, 45)
             ax.set_xlabel("Time (s)"); ax.set_ylabel("Right Motor Command")
             ax.set_title("EXECUTION — Right Motor Command Time Series"); ax.legend()
             _save(fig, "13_execution_motor_right")
@@ -1705,7 +2030,7 @@ finally:
                                label=f"Robot {rid}")
             ax.axhline(0, color="#aaaaaa", lw=1, ls="--")
             ax.axvline(0, color="#aaaaaa", lw=1, ls="--")
-            ax.set_xlim(-35, 35); ax.set_ylim(-35, 35); ax.set_aspect("equal")
+            ax.set_xlim(-45, 45); ax.set_ylim(-45, 45); ax.set_aspect("equal")
             ax.set_xlabel("Left Motor"); ax.set_ylabel("Right Motor")
             ax.set_title("EXECUTION — Motor Action Space Distribution")
             ax.legend(fontsize=9)
@@ -1963,3 +2288,14 @@ finally:
     except Exception as _ge:
         print(f"\n[PLOT ERROR] {_ge}")
         import traceback; traceback.print_exc()
+        OUT_DIR = locals().get("OUT_DIR", "rl_plots")
+
+    # ── Final confirmation — keep the terminal open so the message stays visible ──
+    print("\n" + "#" * 65)
+    print("#  TUM GRAFIKLER OLUSTURULDU")
+    print(f"#  KAYDEDILDIGI KLASOR:\n#    {OUT_DIR}")
+    print("#" * 65)
+    try:
+        input("\n>>> Bitti. Cikmak icin ENTER'a bas...")
+    except Exception:
+        pass
